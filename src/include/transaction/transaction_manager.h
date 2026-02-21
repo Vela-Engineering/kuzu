@@ -50,10 +50,17 @@ public:
 
 private:
     bool hasNoActiveTransactions() const;
+    bool hasNoActiveWriteTransactions() const;
     void checkpointNoLock(main::ClientContext& clientContext);
 
-    // This functions locks the mutex to start new transactions.
+    // This function locks the mutex to stop new transactions and waits until all transactions
+    // (both read and write) leave the system. Used as a fallback.
     common::UniqLock stopNewTransactionsAndWaitUntilAllTransactionsLeave();
+
+    // This function locks the mutex to stop new write transactions and waits until all active
+    // write transactions leave the system. Read transactions are allowed to continue, as
+    // checkpoint does not need to wait for snapshot-isolated readers.
+    common::UniqLock stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
 
     bool hasActiveWriteTransactionNoLock() const;
 

@@ -137,8 +137,33 @@ UniqLock TransactionManager::stopNewTransactionsAndWaitUntilAllTransactionsLeave
     return startTransactionLock;
 }
 
+UniqLock TransactionManager::stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave() {
+    UniqLock startTransactionLock{mtxForStartingNewTransactions};
+    uint64_t numTimesWaited = 0;
+    while (true) {
+        if (hasNoActiveWriteTransactions()) {
+            break;
+        }
+        numTimesWaited++;
+        if (numTimesWaited * THREAD_SLEEP_TIME_WHEN_WAITING_IN_MICROS >
+            checkpointWaitTimeoutInMicros) {
+            throw TransactionManagerException(
+                "Timeout waiting for active write transactions to leave the system before "
+                "checkpointing. If you have an open write transaction, please close it and "
+                "try again.");
+        }
+        std::this_thread::sleep_for(
+            std::chrono::microseconds(THREAD_SLEEP_TIME_WHEN_WAITING_IN_MICROS));
+    }
+    return startTransactionLock;
+}
+
 bool TransactionManager::hasNoActiveTransactions() const {
     return activeTransactions.empty();
+}
+
+bool TransactionManager::hasNoActiveWriteTransactions() const {
+    return !hasActiveWriteTransactionNoLock();
 }
 
 bool TransactionManager::hasActiveWriteTransactionNoLock() const {
@@ -162,15 +187,20 @@ std::unique_ptr<Checkpointer> TransactionManager::initCheckpointer(
 }
 
 void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
-    // Note: It is enough to stop and wait for transactions to leave the system instead of, for
-    // example, checking on the query processor's task scheduler. This is because the
-    // first and last steps that a connection performs when executing a query are to
-    // start and commit/rollback transaction. The query processor also ensures that it
-    // will only return results or error after all threads working on the tasks of a
-    // query stop working on the tasks of the query and these tasks are removed from the
-    // query.
+    // We only need to wait for active write transactions to leave the system before
+    // checkpointing. Read transactions can continue safely because:
+    // 1. Readers use snapshot isolation (MVCC) and only see data committed before their startTS.
+    // 2. Shadow pages are applied with per-page locking, so concurrent optimistic readers will
+    //    detect the version change and retry their read with the updated page data.
+    // 3. The checkpoint only materializes already-committed data, which readers either already
+    //    see (if committed before their startTS) or correctly skip (if committed after).
+    //
+    // The lock must be held for the entire duration of writeCheckpoint() to prevent new write
+    // transactions from starting while the checkpoint is in progress.
+    UniqLock lockForStartingTransaction;
     try {
-        auto lockForStartingTransaction = stopNewTransactionsAndWaitUntilAllTransactionsLeave();
+        lockForStartingTransaction =
+            stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
     } catch (std::exception& e) {
         throw CheckpointException{e};
     }
