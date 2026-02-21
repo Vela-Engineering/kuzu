@@ -201,6 +201,11 @@ public:
     void removeFilePagesFromFrames(FileHandle& fileHandle);
     void updateFrameIfPageIsInFrameWithoutLock(common::file_idx_t fileIdx, const uint8_t* newPage,
         common::page_idx_t pageIdx);
+    // Thread-safe variant of updateFrameIfPageIsInFrameWithoutLock that acquires the page state
+    // lock before updating the frame. The version increment on unlock ensures that concurrent
+    // optimistic readers will detect the change and retry their read.
+    void updateFrameIfPageIsInFrame(common::file_idx_t fileIdx, const uint8_t* newPage,
+        common::page_idx_t pageIdx);
 
     // For files that are managed by BM, their FileHandles should be created through this function.
     FileHandle* getFileHandle(const std::string& filePath, uint8_t flags,
