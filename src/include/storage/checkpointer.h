@@ -32,6 +32,9 @@ public:
     virtual ~Checkpointer();
 
     void writeCheckpoint();
+    // Cleanup after the core checkpoint that does not require the write gate.
+    // Safe to call while new writers are active.
+    void postCheckpointCleanup();
     void rollback();
 
     void readCheckpoint();
@@ -44,7 +47,7 @@ protected:
     virtual void serializeCatalogAndMetadata(DatabaseHeader& databaseHeader,
         bool hasStorageChanges);
     virtual void writeDatabaseHeader(const DatabaseHeader& header);
-    virtual void logCheckpointAndApplyShadowPages();
+    virtual void logCheckpointAndApplyShadowPages(bool walRotated);
 
 private:
     static void readCheckpoint(main::ClientContext* context, catalog::Catalog* catalog,
@@ -56,6 +59,12 @@ private:
 protected:
     main::ClientContext& clientContext;
     bool isInMemory;
+    bool walRotated = false;
+    // Versions captured at the end of writeCheckpoint() while the write gate is still held.
+    // Used by postCheckpointCleanup() to safely reset version tracking without losing
+    // concurrent version bumps from writers that started after the gate was released.
+    uint64_t catalogVersionAtCheckpoint = 0;
+    uint64_t pageManagerVersionAtCheckpoint = 0;
 };
 
 } // namespace storage

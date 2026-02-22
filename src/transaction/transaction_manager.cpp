@@ -19,10 +19,13 @@ namespace transaction {
 
 Transaction* TransactionManager::beginTransaction(main::ClientContext& clientContext,
     TransactionType type) {
-    // We acquire the lock for starting new transactions. In case this cannot be acquired, this
-    // ensures calls to other public functions are not restricted.
     std::unique_lock publicFunctionLck{mtxForSerializingPublicFunctionCalls};
-    std::unique_lock newTransactionLck{mtxForStartingNewTransactions};
+    // Only acquire the write gate for write/recovery transactions. Read-only transactions
+    // can start freely during checkpoint since they use snapshot isolation.
+    std::unique_lock newTransactionLck{mtxForStartingNewTransactions, std::defer_lock};
+    if (type != TransactionType::READ_ONLY) {
+        newTransactionLck.lock();
+    }
     switch (type) {
     case TransactionType::READ_ONLY: {
         auto transaction =
@@ -42,6 +45,7 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
         if (transaction->shouldLogToWAL()) {
             transaction->getLocalWAL().logBeginTransaction();
         }
+        activeWriteTransactionCount.fetch_add(1, std::memory_order_release);
         activeTransactions.push_back(std::move(transaction));
         return activeTransactions.back().get();
     }
@@ -54,29 +58,35 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
 }
 
 void TransactionManager::commit(main::ClientContext& clientContext, Transaction* transaction) {
-    std::unique_lock lck{mtxForSerializingPublicFunctionCalls};
-    clientContext.cleanUp();
-    switch (transaction->getType()) {
-    case TransactionType::READ_ONLY: {
-        clearTransactionNoLock(transaction->getID());
-    } break;
-    case TransactionType::RECOVERY:
-    case TransactionType::WRITE: {
-        lastTimestamp++;
-        transaction->commitTS = lastTimestamp;
-        transaction->commit(&wal);
-        auto shouldCheckpoint = transaction->shouldForceCheckpoint() ||
-                                Checkpointer::canAutoCheckpoint(clientContext, *transaction);
-        clearTransactionNoLock(transaction->getID());
-        if (shouldCheckpoint) {
-            checkpointNoLock(clientContext);
+    bool shouldCheckpoint = false;
+    {
+        std::unique_lock lck{mtxForSerializingPublicFunctionCalls};
+        clientContext.cleanUp();
+        switch (transaction->getType()) {
+        case TransactionType::READ_ONLY: {
+            clearTransactionNoLock(transaction->getID());
+        } break;
+        case TransactionType::RECOVERY:
+        case TransactionType::WRITE: {
+            lastTimestamp++;
+            transaction->commitTS = lastTimestamp;
+            transaction->commit(&wal);
+            shouldCheckpoint = transaction->shouldForceCheckpoint() ||
+                               Checkpointer::canAutoCheckpoint(clientContext, *transaction);
+            clearTransactionNoLock(transaction->getID());
+            activeWriteTransactionCount.fetch_sub(1, std::memory_order_release);
+        } break;
+            // LCOV_EXCL_START
+        default: {
+            throw TransactionManagerException("Invalid transaction type to commit.");
         }
-    } break;
-        // LCOV_EXCL_START
-    default: {
-        throw TransactionManagerException("Invalid transaction type to commit.");
+            // LCOV_EXCL_STOP
+        }
     }
-        // LCOV_EXCL_STOP
+    // Checkpoint outside the public function lock so active writers can finish
+    // (commit/rollback) during the drain phase instead of deadlocking.
+    if (shouldCheckpoint) {
+        tryCheckpoint(clientContext);
     }
 }
 
@@ -94,6 +104,7 @@ void TransactionManager::rollback(main::ClientContext& clientContext, Transactio
     case TransactionType::WRITE: {
         transaction->rollback(&wal);
         clearTransactionNoLock(transaction->getID());
+        activeWriteTransactionCount.fetch_sub(1, std::memory_order_release);
     } break;
     default: {
         throw TransactionManagerException("Invalid transaction type to rollback.");
@@ -102,10 +113,12 @@ void TransactionManager::rollback(main::ClientContext& clientContext, Transactio
 }
 
 void TransactionManager::checkpoint(main::ClientContext& clientContext) {
-    UniqLock lck{mtxForSerializingPublicFunctionCalls};
     if (clientContext.isInMemory()) {
         return;
     }
+    // Use the dedicated checkpoint mutex so active writers can still commit/rollback
+    // during the drain phase (they only need mtxForSerializingPublicFunctionCalls).
+    std::unique_lock checkpointLck{mtxForCheckpoint};
     checkpointNoLock(clientContext);
 }
 
@@ -141,7 +154,7 @@ UniqLock TransactionManager::stopNewWriteTransactionsAndWaitUntilAllWriteTransac
     UniqLock startTransactionLock{mtxForStartingNewTransactions};
     uint64_t numTimesWaited = 0;
     while (true) {
-        if (hasNoActiveWriteTransactions()) {
+        if (!hasActiveWriteTransactionNoLock()) {
             break;
         }
         numTimesWaited++;
@@ -162,15 +175,6 @@ bool TransactionManager::hasNoActiveTransactions() const {
     return activeTransactions.empty();
 }
 
-bool TransactionManager::hasNoActiveWriteTransactions() const {
-    return !hasActiveWriteTransactionNoLock();
-}
-
-bool TransactionManager::hasActiveWriteTransactionNoLock() const {
-    return std::ranges::any_of(activeTransactions,
-        [](const auto& transaction) { return transaction->isWriteTransaction(); });
-}
-
 void TransactionManager::clearTransactionNoLock(transaction_t transactionID) {
     KU_ASSERT(std::ranges::any_of(activeTransactions.begin(), activeTransactions.end(),
         [transactionID](const auto& activeTransaction) {
@@ -186,6 +190,17 @@ std::unique_ptr<Checkpointer> TransactionManager::initCheckpointer(
     return std::make_unique<Checkpointer>(clientContext);
 }
 
+void TransactionManager::tryCheckpoint(main::ClientContext& clientContext) {
+    if (clientContext.isInMemory()) {
+        return;
+    }
+    std::unique_lock checkpointLck{mtxForCheckpoint, std::try_to_lock};
+    if (!checkpointLck.owns_lock()) {
+        return;
+    }
+    checkpointNoLock(clientContext);
+}
+
 void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     // We only need to wait for active write transactions to leave the system before
     // checkpointing. Read transactions can continue safely because:
@@ -194,13 +209,9 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     //    detect the version change and retry their read with the updated page data.
     // 3. The checkpoint only materializes already-committed data, which readers either already
     //    see (if committed before their startTS) or correctly skip (if committed after).
-    //
-    // The lock must be held for the entire duration of writeCheckpoint() to prevent new write
-    // transactions from starting while the checkpoint is in progress.
-    UniqLock lockForStartingTransaction;
+    UniqLock writeGate;
     try {
-        lockForStartingTransaction =
-            stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
+        writeGate = stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
     } catch (std::exception& e) {
         throw CheckpointException{e};
     }
@@ -211,6 +222,10 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
         checkpointer->rollback();
         throw CheckpointException{e};
     }
+    // Release the write gate after shadow pages are applied and the new base state is
+    // established. New write transactions can now start and commit to the active WAL.
+    writeGate = {};
+    checkpointer->postCheckpointCleanup();
 }
 
 } // namespace transaction

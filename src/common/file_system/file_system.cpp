@@ -1,5 +1,7 @@
 #include "common/file_system/file_system.h"
 
+#include "common/exception/io.h"
+#include "common/string_format.h"
 #include "common/string_utils.h"
 
 namespace kuzu {
@@ -7,6 +9,15 @@ namespace common {
 
 void FileSystem::overwriteFile(const std::string& /*from*/, const std::string& /*to*/) {
     KU_UNREACHABLE;
+}
+
+void FileSystem::renameFile(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (ec) {
+        throw IOException(stringFormat("Error renaming file {} to {}. ErrorMessage: {}", from, to,
+            ec.message()));
+    }
 }
 
 void FileSystem::copyFile(const std::string& /*from*/, const std::string& /*to*/) {

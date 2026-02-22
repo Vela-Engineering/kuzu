@@ -198,10 +198,17 @@ public:
     std::vector<std::string> getMacroNames(const transaction::Transaction* transaction) const;
     void dropMacro(transaction::Transaction* transaction, std::string& name);
 
-    void incrementVersion() { version++; }
-    uint64_t getVersion() const { return version; }
-    bool changedSinceLastCheckpoint() const { return version != 0; }
-    void resetVersion() { version = 0; }
+    void incrementVersion() { version.fetch_add(1, std::memory_order_relaxed); }
+    uint64_t getVersion() const { return version.load(std::memory_order_relaxed); }
+    bool changedSinceLastCheckpoint() const {
+        return version.load(std::memory_order_relaxed) != lastCheckpointVersion;
+    }
+    void resetVersion() {
+        lastCheckpointVersion = version.load(std::memory_order_relaxed);
+    }
+    void resetVersion(uint64_t checkpointedVersion) {
+        lastCheckpointVersion = checkpointedVersion;
+    }
 
     void serialize(common::Serializer& ser) const;
     void deserialize(common::Deserializer& deSer);
@@ -241,9 +248,8 @@ private:
     std::unique_ptr<CatalogSet> internalSequences;
     std::unique_ptr<CatalogSet> internalFunctions;
 
-    // incremented whenever a change is made to the catalog
-    // reset to 0 at the end of each checkpoint
-    uint64_t version;
+    std::atomic<uint64_t> version;
+    uint64_t lastCheckpointVersion = 0;
 };
 
 } // namespace catalog

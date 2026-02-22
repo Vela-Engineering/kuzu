@@ -19,6 +19,10 @@ public:
     void logCommittedWAL(LocalWAL& localWAL, main::ClientContext* context);
     void logAndFlushCheckpoint(main::ClientContext* context);
 
+    bool rotateForCheckpoint(main::ClientContext* context);
+    void logAndFlushCheckpointToFrozen(main::ClientContext* context);
+    void clearFrozenWAL();
+
     // Clear any buffer in the WAL writer. Also truncate the WAL file to 0 bytes.
     void clear();
     // Reset the WAL writer to nullptr, and remove the WAL file if it exists.
@@ -37,6 +41,7 @@ private:
 private:
     std::mutex mtx;
     std::string walPath;
+    std::string checkpointWalPath;
     bool inMemory;
     [[maybe_unused]] bool readOnly;
     common::VirtualFileSystem* vfs;
