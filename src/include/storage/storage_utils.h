@@ -69,6 +69,10 @@ public:
     static std::string getWALFilePath(const std::string& path) {
         return common::stringFormat("{}.{}", path, common::StorageConstants::WAL_FILE_SUFFIX);
     }
+    static std::string getCheckpointWALFilePath(const std::string& path) {
+        return common::stringFormat("{}.{}", path,
+            common::StorageConstants::CHECKPOINT_WAL_FILE_SUFFIX);
+    }
     static std::string getShadowFilePath(const std::string& path) {
         return common::stringFormat("{}.{}", path, common::StorageConstants::SHADOWING_SUFFIX);
     }

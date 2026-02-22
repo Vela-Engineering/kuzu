@@ -67,31 +67,40 @@ void Checkpointer::writeCheckpoint() {
         return;
     }
 
+    auto storageManager = StorageManager::Get(clientContext);
+    walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
+
     auto databaseHeader =
-        *StorageManager::Get(clientContext)->getOrInitDatabaseHeader(clientContext);
-    // Checkpoint storage. Note that we first checkpoint storage before serializing the catalog, as
-    // checkpointing storage may overwrite columnIDs in the catalog.
+        *storageManager->getOrInitDatabaseHeader(clientContext);
     bool hasStorageChanges = checkpointStorage();
     serializeCatalogAndMetadata(databaseHeader, hasStorageChanges);
     writeDatabaseHeader(databaseHeader);
-    logCheckpointAndApplyShadowPages();
+    logCheckpointAndApplyShadowPages(walRotated);
 
-    // This function will evict all pages that were freed during this checkpoint
-    // It must be called before we remove all evicted candidates from the BM
-    // Or else the evicted pages may end up appearing multiple times in the eviction queue
+    // Snapshot versions while the write gate is still held, before postCheckpointCleanup
+    // runs with the gate released. This prevents capturing version bumps from new writers.
+    catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
+    pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
+}
+
+void Checkpointer::postCheckpointCleanup() {
+    if (isInMemory) {
+        return;
+    }
+
     auto storageManager = StorageManager::Get(clientContext);
     storageManager->finalizeCheckpoint();
-    // When a page is freed by the FSM, it evicts it from the BM. However, if the page is freed,
-    // then reused over and over, it can be appended to the eviction queue multiple times. To
-    // prevent multiple entries of the same page from existing in the eviction queue, at the end of
-    // each checkpoint we remove any already-evicted pages.
     auto bufferManager = MemoryManager::Get(clientContext)->getBufferManager();
     bufferManager->removeEvictedCandidates();
 
-    catalog::Catalog::Get(clientContext)->resetVersion();
+    catalog::Catalog::Get(clientContext)->resetVersion(catalogVersionAtCheckpoint);
     auto* dataFH = storageManager->getDataFH();
-    dataFH->getPageManager()->resetVersion();
-    storageManager->getWAL().reset();
+    dataFH->getPageManager()->resetVersion(pageManagerVersionAtCheckpoint);
+    if (walRotated) {
+        storageManager->getWAL().clearFrozenWAL();
+    } else {
+        storageManager->getWAL().reset();
+    }
     storageManager->getShadowFile().reset();
 }
 
@@ -144,22 +153,21 @@ void Checkpointer::writeDatabaseHeader(const DatabaseHeader& header) {
     StorageManager::Get(clientContext)->setDatabaseHeader(std::make_unique<DatabaseHeader>(header));
 }
 
-void Checkpointer::logCheckpointAndApplyShadowPages() {
+void Checkpointer::logCheckpointAndApplyShadowPages(bool walRotated) {
     const auto storageManager = StorageManager::Get(clientContext);
     auto& shadowFile = storageManager->getShadowFile();
-    // Flush the shadow file.
     shadowFile.flushAll(clientContext);
     auto wal = WAL::Get(clientContext);
-    // Log the checkpoint to the WAL and flush WAL. This indicates that all shadow pages and
-    // files (snapshots of catalog and metadata) have been written to disk. The part that is not
-    // done is to replace them with the original pages or catalog and metadata files. If the
-    // system crashes before this point, the WAL can still be used to recover the system to a
-    // state where the checkpoint can be redone.
-    wal->logAndFlushCheckpoint(&clientContext);
+    if (walRotated) {
+        wal->logAndFlushCheckpointToFrozen(&clientContext);
+    } else {
+        wal->logAndFlushCheckpoint(&clientContext);
+    }
     shadowFile.applyShadowPages(clientContext);
-    // Clear the wal and also shadowing files.
     auto bufferManager = MemoryManager::Get(clientContext)->getBufferManager();
-    wal->clear();
+    if (!walRotated) {
+        wal->clear();
+    }
     shadowFile.clear(*bufferManager);
 }
 

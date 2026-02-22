@@ -205,6 +205,15 @@ void LocalFileSystem::overwriteFile(const std::string& from, const std::string& 
     }
 }
 
+void LocalFileSystem::renameFile(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    if (ec) {
+        throw IOException(stringFormat("Error renaming file {} to {}. ErrorMessage: {}", from, to,
+            ec.message()));
+    }
+}
+
 void LocalFileSystem::copyFile(const std::string& from, const std::string& to) {
     if (!fileOrPathExists(from)) {
         return;
@@ -260,6 +269,7 @@ void LocalFileSystem::createDir(const std::string& dir) const {
 static std::unordered_set<std::string> getDatabaseFileSet(const std::string& path) {
     std::unordered_set<std::string> result;
     result.insert(storage::StorageUtils::getWALFilePath(path));
+    result.insert(storage::StorageUtils::getCheckpointWALFilePath(path));
     result.insert(storage::StorageUtils::getShadowFilePath(path));
     result.insert(storage::StorageUtils::getTmpFilePath(path));
     return result;
