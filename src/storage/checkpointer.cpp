@@ -14,6 +14,7 @@
 #include "storage/shadow_utils.h"
 #include "storage/storage_manager.h"
 #include "storage/wal/local_wal.h"
+#include "transaction/transaction.h"
 
 namespace kuzu {
 namespace storage {
@@ -34,6 +35,16 @@ PageRange Checkpointer::serializeCatalog(const catalog::Catalog& catalog,
     return catalogWriter->flush(*pageAllocator, storageManager.getShadowFile());
 }
 
+PageRange Checkpointer::serializeCatalogSnapshot(const catalog::Catalog& catalog,
+    StorageManager& storageManager) {
+    auto catalogWriter =
+        std::make_shared<common::InMemFileWriter>(*MemoryManager::Get(clientContext));
+    common::Serializer catalogSerializer(catalogWriter);
+    catalog.serializeSnapshot(catalogSerializer, snapshotTS);
+    auto pageAllocator = storageManager.getDataFH()->getPageManager();
+    return catalogWriter->flush(*pageAllocator, storageManager.getShadowFile());
+}
+
 PageRange Checkpointer::serializeMetadata(const catalog::Catalog& catalog,
     StorageManager& storageManager) {
     auto metadataWriter =
@@ -50,6 +61,27 @@ PageRange Checkpointer::serializeMetadata(const catalog::Catalog& catalog,
     // flush the metadata writer. This may cause a discrepancy between the number of tracked pages
     // and the number of physical pages in the file but shouldn't cause any actual incorrect
     // behavior in the database.
+    auto& pageManager = *storageManager.getDataFH()->getPageManager();
+    const auto pagesForPageManager = pageManager.estimatePagesNeededForSerialize();
+    auto pageAllocator = storageManager.getDataFH()->getPageManager();
+    const auto allocatedPages = pageAllocator->allocatePageRange(
+        metadataWriter->getNumPagesToFlush() + pagesForPageManager);
+    pageManager.serialize(metadataSerializer);
+
+    metadataWriter->flush(allocatedPages, pageAllocator->getDataFH(),
+        storageManager.getShadowFile());
+    return allocatedPages;
+}
+
+PageRange Checkpointer::serializeMetadataSnapshot(const catalog::Catalog& catalog,
+    StorageManager& storageManager) {
+    auto metadataWriter =
+        std::make_shared<common::InMemFileWriter>(*MemoryManager::Get(clientContext));
+    common::Serializer metadataSerializer(metadataWriter);
+    const transaction::Transaction snapshotTxn(transaction::TransactionType::CHECKPOINT,
+        transaction::Transaction::DUMMY_TRANSACTION_ID, snapshotTS);
+    storageManager.serialize(catalog, snapshotTxn, metadataSerializer);
+
     auto& pageManager = *storageManager.getDataFH()->getPageManager();
     const auto pagesForPageManager = pageManager.estimatePagesNeededForSerialize();
     auto pageAllocator = storageManager.getDataFH()->getPageManager();
@@ -83,6 +115,33 @@ void Checkpointer::writeCheckpoint() {
     pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
 }
 
+void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
+    if (isInMemory) {
+        return;
+    }
+
+    snapshotTS = snapshotTimestamp;
+
+    auto storageManager = StorageManager::Get(clientContext);
+    walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
+
+    checkpointHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+    hasStorageChanges = checkpointStorage();
+
+    // Capture versions while the write gate is still held.
+    catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
+    pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
+}
+
+void Checkpointer::finishCheckpoint() {
+    if (isInMemory) {
+        return;
+    }
+    serializeCatalogAndMetadata(checkpointHeader, hasStorageChanges);
+    writeDatabaseHeader(checkpointHeader);
+    logCheckpointAndApplyShadowPages(walRotated);
+}
+
 void Checkpointer::postCheckpointCleanup() {
     if (isInMemory) {
         return;
@@ -111,25 +170,25 @@ bool Checkpointer::checkpointStorage() {
 }
 
 void Checkpointer::serializeCatalogAndMetadata(DatabaseHeader& databaseHeader,
-    bool hasStorageChanges) {
+    bool storageChanges) {
     const auto storageManager = StorageManager::Get(clientContext);
     const auto catalog = catalog::Catalog::Get(clientContext);
     auto* dataFH = storageManager->getDataFH();
+    const bool useSnapshot = snapshotTS > 0;
 
-    // Serialize the catalog if there are changes
     if (databaseHeader.catalogPageRange.startPageIdx == common::INVALID_PAGE_IDX ||
         catalog->changedSinceLastCheckpoint()) {
         databaseHeader.updateCatalogPageRange(*dataFH->getPageManager(),
-            serializeCatalog(*catalog, *storageManager));
+            useSnapshot ? serializeCatalogSnapshot(*catalog, *storageManager)
+                        : serializeCatalog(*catalog, *storageManager));
     }
-    // Serialize the storage metadata if there are changes
     if (databaseHeader.metadataPageRange.startPageIdx == common::INVALID_PAGE_IDX ||
-        hasStorageChanges || catalog->changedSinceLastCheckpoint() ||
+        storageChanges || catalog->changedSinceLastCheckpoint() ||
         dataFH->getPageManager()->changedSinceLastCheckpoint()) {
-        // We must free the existing metadata page range before serializing
-        // So that the freed pages are serialized by the FSM
         databaseHeader.freeMetadataPageRange(*dataFH->getPageManager());
-        databaseHeader.metadataPageRange = serializeMetadata(*catalog, *storageManager);
+        databaseHeader.metadataPageRange =
+            useSnapshot ? serializeMetadataSnapshot(*catalog, *storageManager)
+                        : serializeMetadata(*catalog, *storageManager);
     }
 }
 

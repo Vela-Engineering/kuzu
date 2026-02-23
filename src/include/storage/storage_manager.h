@@ -60,6 +60,8 @@ public:
         const std::string& typeName) const;
 
     void serialize(const catalog::Catalog& catalog, common::Serializer& ser);
+    void serialize(const catalog::Catalog& catalog, const transaction::Transaction& snapshotTxn,
+        common::Serializer& ser);
     // We need to pass in the catalog and storageManager explicitly as they can be from
     // attachedDatabase.
     void deserialize(main::ClientContext* context, const catalog::Catalog* catalog,

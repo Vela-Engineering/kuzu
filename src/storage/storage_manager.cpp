@@ -240,6 +240,42 @@ void StorageManager::serialize(const Catalog& catalog, Serializer& ser) {
     }
 }
 
+void StorageManager::serialize(const Catalog& catalog, const Transaction& snapshotTxn,
+    Serializer& ser) {
+    // Collect catalog entries before locking mtx to avoid lock ordering inversion
+    // with DDL paths that take catalog lock then StorageManager lock.
+    auto nodeTableEntries = catalog.getNodeTableEntries(&snapshotTxn);
+    auto relGroupEntries = catalog.getRelGroupEntries(&snapshotTxn);
+    std::sort(nodeTableEntries.begin(), nodeTableEntries.end(),
+        [](const auto& a, const auto& b) { return a->getTableID() < b->getTableID(); });
+    std::sort(relGroupEntries.begin(), relGroupEntries.end(),
+        [](const auto& a, const auto& b) { return a->getTableID() < b->getTableID(); });
+
+    std::lock_guard lck{mtx};
+    ser.writeDebuggingInfo("num_node_tables");
+    ser.write<uint64_t>(nodeTableEntries.size());
+    for (const auto tableEntry : nodeTableEntries) {
+        KU_ASSERT(tables.contains(tableEntry->getTableID()));
+        ser.writeDebuggingInfo("table_id");
+        ser.write<table_id_t>(tableEntry->getTableID());
+        tables.at(tableEntry->getTableID())->serialize(ser);
+    }
+    ser.writeDebuggingInfo("num_rel_groups");
+    ser.write<uint64_t>(relGroupEntries.size());
+    for (const auto entry : relGroupEntries) {
+        const auto& relGroupEntry = entry->cast<RelGroupCatalogEntry>();
+        ser.writeDebuggingInfo("rel_group_id");
+        ser.write<table_id_t>(relGroupEntry.getTableID());
+        ser.writeDebuggingInfo("num_inner_rel_tables");
+        ser.write<uint64_t>(relGroupEntry.getNumRelTables());
+        for (auto& info : relGroupEntry.getRelEntryInfos()) {
+            KU_ASSERT(tables.contains(info.oid));
+            info.serialize(ser);
+            tables.at(info.oid)->serialize(ser);
+        }
+    }
+}
+
 void StorageManager::deserialize(main::ClientContext* context, const Catalog* catalog,
     Deserializer& deSer) {
     std::string key;
