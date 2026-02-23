@@ -1,0 +1,107 @@
+name: Build and Release Python Wheels
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create source distribution
+        working-directory: ./scripts/pip-package
+        run: |
+          mkdir -p wheelhouse
+          python3 package_tar.py kuzu.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package/kuzu.tar.gz
+
+  build-linux-wheels:
+    needs: build-sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "pp* *musllinux*"
+          CIBW_ARCHS_LINUX: "x86_64 aarch64"
+          CIBW_BUILD_VERBOSITY: 1
+        with:
+          package-dir: ./scripts/pip-package/kuzu.tar.gz
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-wheels
+          path: wheelhouse/*.whl
+
+  build-mac-wheels:
+    needs: build-sdist
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "pp*"
+          CIBW_ARCHS_MACOS: "arm64 x86_64"
+          CIBW_BUILD_VERBOSITY: 1
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        with:
+          package-dir: ./scripts/pip-package/kuzu.tar.gz
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-wheels
+          path: wheelhouse/*.whl
+
+  release:
+    needs: [build-linux-wheels, build-mac-wheels]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'project\(Kuzu VERSION \K[0-9.]+' CMakeLists.txt)
+          SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "tag=v${VERSION}-vela.${SHA}" >> $GITHUB_OUTPUT
+          echo "name=Kuzu ${VERSION} (vela ${SHA})" >> $GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.name }}
+          files: wheels/*.whl
+          generate_release_notes: true
