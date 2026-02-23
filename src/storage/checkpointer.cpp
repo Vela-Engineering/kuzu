@@ -126,11 +126,20 @@ void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
     checkpointHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
-    hasStorageChanges = checkpointStorage();
 
-    // Capture versions while the write gate is still held.
+    // Capture versions while the write gate is still held, before checkpointStoragePhase
+    // runs with the gate released. This prevents losing version bumps from new writers
+    // that start after the gate is released.
     catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
     pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
+    tableEpochWatermarks = storageManager->captureChangeEpochs();
+}
+
+void Checkpointer::checkpointStoragePhase() {
+    if (isInMemory) {
+        return;
+    }
+    hasStorageChanges = checkpointStorage();
 }
 
 void Checkpointer::finishCheckpoint() {
@@ -166,6 +175,12 @@ void Checkpointer::postCheckpointCleanup() {
 bool Checkpointer::checkpointStorage() {
     const auto storageManager = StorageManager::Get(clientContext);
     auto pageAllocator = storageManager->getDataFH()->getPageManager();
+    if (snapshotTS > 0) {
+        const transaction::Transaction snapshotTxn(transaction::TransactionType::CHECKPOINT,
+            transaction::Transaction::DUMMY_TRANSACTION_ID, snapshotTS);
+        return storageManager->checkpoint(&clientContext, snapshotTxn, *pageAllocator,
+            tableEpochWatermarks);
+    }
     return storageManager->checkpoint(&clientContext, *pageAllocator);
 }
 

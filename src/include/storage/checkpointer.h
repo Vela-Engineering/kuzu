@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 #include "common/types/types.h"
 #include "storage/database_header.h"
 #include "storage/page_range.h"
@@ -34,6 +36,9 @@ public:
 
     void writeCheckpoint();
     void beginCheckpoint(common::transaction_t snapshotTS);
+    // Storage materialization phase. Safe to call after the write gate is released.
+    // Uses the snapshot transaction for MVCC-consistent version chain traversal.
+    void checkpointStoragePhase();
     void finishCheckpoint();
     // Cleanup after the core checkpoint that does not require the write gate.
     // Safe to call while new writers are active.
@@ -79,6 +84,9 @@ protected:
     // concurrent version bumps from writers that started after the gate was released.
     uint64_t catalogVersionAtCheckpoint = 0;
     uint64_t pageManagerVersionAtCheckpoint = 0;
+    // Per-table changeEpoch watermarks captured under the write gate.
+    // Used to avoid clearing post-snapshot dirty signals from concurrent writers.
+    std::unordered_map<common::table_id_t, uint64_t> tableEpochWatermarks;
 };
 
 } // namespace storage

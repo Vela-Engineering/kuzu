@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mutex>
+#include <shared_mutex>
 
 #include "catalog/catalog.h"
 #include "shadow_file.h"
@@ -42,6 +43,13 @@ public:
         const catalog::RelTableCatalogInfo& info);
 
     bool checkpoint(main::ClientContext* context, PageAllocator& pageAllocator);
+    bool checkpoint(main::ClientContext* context, const transaction::Transaction& snapshotTxn,
+        PageAllocator& pageAllocator,
+        const std::unordered_map<common::table_id_t, uint64_t>& epochWatermarks);
+
+    // Capture the current changeEpoch for every table. Must be called under the
+    // write gate so that no active writers can bump epochs concurrently.
+    std::unordered_map<common::table_id_t, uint64_t> captureChangeEpochs() const;
     void finalizeCheckpoint();
     void rollbackCheckpoint(const catalog::Catalog& catalog);
 
@@ -87,7 +95,7 @@ private:
     void reclaimDroppedTables(const catalog::Catalog& catalog);
 
 private:
-    std::mutex mtx;
+    mutable std::shared_mutex mtx;
     std::string databasePath;
     std::unique_ptr<storage::DatabaseHeader> databaseHeader;
     bool readOnly;
