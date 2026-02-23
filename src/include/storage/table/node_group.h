@@ -48,11 +48,13 @@ struct NodeGroupCheckpointState {
     std::vector<Column*> columns;
     PageAllocator& pageAllocator;
     MemoryManager* mm;
+    const transaction::Transaction* transaction;
 
     NodeGroupCheckpointState(std::vector<common::column_id_t> columnIDs,
-        std::vector<Column*> columns, PageAllocator& pageAllocator, MemoryManager* mm)
+        std::vector<Column*> columns, PageAllocator& pageAllocator, MemoryManager* mm,
+        const transaction::Transaction* transaction = nullptr)
         : columnIDs{std::move(columnIDs)}, columns{std::move(columns)},
-          pageAllocator{pageAllocator}, mm{mm} {}
+          pageAllocator{pageAllocator}, mm{mm}, transaction{transaction} {}
     virtual ~NodeGroupCheckpointState() = default;
 
     template<typename T>
@@ -236,7 +238,8 @@ private:
     template<ResidencyState SCAN_RESIDENCY_STATE>
     std::unique_ptr<InMemChunkedNodeGroup> scanAllInsertedAndVersions(MemoryManager& memoryManager,
         const common::UniqLock& lock, const std::vector<common::column_id_t>& columnIDs,
-        const std::vector<const Column*>& columns) const;
+        const std::vector<const Column*>& columns,
+        const transaction::Transaction* transaction) const;
 
     virtual NodeGroupScanResult scanInternal(const common::UniqLock& lock,
         transaction::Transaction* transaction, TableScanState& state,
@@ -247,7 +250,7 @@ private:
 
     void scanCommittedUpdatesForColumn(std::vector<ChunkCheckpointState>& chunkCheckpointStates,
         MemoryManager& memoryManager, const common::UniqLock& lock, common::column_id_t columnID,
-        const Column* column) const;
+        const Column* column, const transaction::Transaction* transaction) const;
 
 protected:
     MemoryManager& mm;

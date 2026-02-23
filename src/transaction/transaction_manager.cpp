@@ -228,6 +228,16 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     if (checkpointer->wasWalRotated()) {
         writeGate = {};
     }
+    // Storage materialization runs after the gate is released. Writers can start new
+    // transactions while tables are being checkpointed. Per-node-group locks provide
+    // fine-grained mutual exclusion, and the snapshot transaction ensures a consistent
+    // MVCC view of version chains.
+    try {
+        checkpointer->checkpointStoragePhase();
+    } catch (std::exception& e) {
+        checkpointer->rollback();
+        throw CheckpointException{e};
+    }
     try {
         checkpointer->finishCheckpoint();
     } catch (std::exception& e) {
