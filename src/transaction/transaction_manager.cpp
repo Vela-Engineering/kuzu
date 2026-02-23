@@ -217,13 +217,23 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     }
     auto checkpointer = initCheckpointerFunc(clientContext);
     try {
-        checkpointer->writeCheckpoint();
+        checkpointer->beginCheckpoint(lastTimestamp);
     } catch (std::exception& e) {
         checkpointer->rollback();
         throw CheckpointException{e};
     }
-    // Release the write gate after shadow pages are applied and the new base state is
-    // established. New write transactions can now start and commit to the active WAL.
+    // Release the write gate early when WAL was rotated (common case). New writers
+    // create a fresh active WAL, isolated from the frozen checkpoint WAL. When WAL
+    // was not rotated (no WAL existed), keep the gate to prevent WAL races.
+    if (checkpointer->wasWalRotated()) {
+        writeGate = {};
+    }
+    try {
+        checkpointer->finishCheckpoint();
+    } catch (std::exception& e) {
+        checkpointer->rollback();
+        throw CheckpointException{e};
+    }
     writeGate = {};
     checkpointer->postCheckpointCleanup();
 }

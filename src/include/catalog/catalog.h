@@ -211,6 +211,7 @@ public:
     }
 
     void serialize(common::Serializer& ser) const;
+    void serializeSnapshot(common::Serializer& ser, common::transaction_t snapshotTS) const;
     void deserialize(common::Deserializer& deSer);
 
     template<class TARGET>
