@@ -33,13 +33,19 @@ jobs:
           name: sdist
           path: ./scripts/pip-package
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22
         env:
-          CIBW_BUILD: "cp311-* cp312-* cp313-*"
+          CIBW_BUILD: "cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
           CIBW_SKIP: "pp* *musllinux*"
-          CIBW_ARCHS_LINUX: "x86_64 aarch64"
-          CIBW_BEFORE_BUILD: "pip install cmake && yum install -y ninja-build || apt-get install -y ninja-build || true"
+          CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
+          CIBW_BEFORE_BUILD: "pip install cmake ninja"
+          CIBW_ENVIRONMENT: "NUM_THREADS=4"
           CIBW_BUILD_VERBOSITY: 1
         with:
           package-dir: ./scripts/pip-package/kuzu.tar.gz
@@ -64,10 +70,10 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22
         env:
-          CIBW_BUILD: "cp311-* cp312-* cp313-*"
+          CIBW_BUILD: "cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64"
           CIBW_SKIP: "pp*"
-          CIBW_ARCHS_MACOS: "arm64 x86_64"
           CIBW_BEFORE_BUILD: "pip install cmake ninja"
+          CIBW_ENVIRONMENT: "NUM_THREADS=4"
           CIBW_BUILD_VERBOSITY: 1
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         with:

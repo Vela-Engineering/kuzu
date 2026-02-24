@@ -75,8 +75,8 @@ class CMakeBuild(build_ext):
 
         build_dir = os.path.join(ext.sourcedir, 'kuzu-source')
 
-        # Clean the build directory.
-        subprocess.run(['make', 'clean'], check=True, cwd=build_dir)
+        # Clean the build directory (ignore failure on fresh sdist).
+        subprocess.run(['make', 'clean'], cwd=build_dir)
 
         try:
             num_cores = int(os.environ['NUM_THREADS'])
