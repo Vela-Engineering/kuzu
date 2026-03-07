@@ -1,0 +1,265 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  # ──────────────────────────────────────────────────
+  # Python wheels
+  # ──────────────────────────────────────────────────
+  build-sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create source distribution
+        working-directory: ./scripts/pip-package
+        run: |
+          mkdir -p wheelhouse
+          python3 package_tar.py kuzu.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package/kuzu.tar.gz
+
+  build-linux-x86-wheels:
+    needs: build-sdist
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+          CIBW_SKIP: "pp* *musllinux*"
+          CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
+          CIBW_ARCHS_LINUX: "x86_64"
+          CIBW_BEFORE_ALL: "yum install -y cmake ninja-build"
+          CIBW_ENVIRONMENT: "NUM_THREADS=3"
+          CIBW_BUILD_VERBOSITY: 1
+        with:
+          package-dir: ./scripts/pip-package/kuzu.tar.gz
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86-wheels
+          path: wheelhouse/*.whl
+
+  build-linux-arm64-wheels:
+    needs: build-sdist
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+          CIBW_SKIP: "pp* *musllinux*"
+          CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
+          CIBW_ARCHS_LINUX: "aarch64"
+          CIBW_BEFORE_ALL: "yum install -y cmake ninja-build"
+          CIBW_ENVIRONMENT: "NUM_THREADS=4"
+          CIBW_BUILD_VERBOSITY: 1
+        with:
+          package-dir: ./scripts/pip-package/kuzu.tar.gz
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-wheels
+          path: wheelhouse/*.whl
+
+  build-mac-wheels:
+    needs: build-sdist
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64"
+          CIBW_SKIP: "pp*"
+          CIBW_ENVIRONMENT: "NUM_THREADS=3 MACOSX_DEPLOYMENT_TARGET=11.0"
+          CIBW_BUILD_VERBOSITY: 1
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          package-dir: ./scripts/pip-package/kuzu.tar.gz
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-wheels
+          path: wheelhouse/*.whl
+
+  # ──────────────────────────────────────────────────
+  # Node.js addon
+  # ──────────────────────────────────────────────────
+  build-nodejs-linux-x86:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Build Node.js addon
+        run: make nodejs NUM_THREADS=$(nproc)
+
+      - name: Rename prebuilt binary
+        run: |
+          mkdir -p tools/nodejs_api/prebuilt
+          cp tools/nodejs_api/build/kuzujs.node tools/nodejs_api/prebuilt/kuzujs-linux-x64.node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-linux-x64
+          path: tools/nodejs_api/prebuilt/kuzujs-linux-x64.node
+
+  build-nodejs-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Build Node.js addon
+        run: make nodejs NUM_THREADS=$(nproc)
+
+      - name: Rename prebuilt binary
+        run: |
+          mkdir -p tools/nodejs_api/prebuilt
+          cp tools/nodejs_api/build/kuzujs.node tools/nodejs_api/prebuilt/kuzujs-linux-arm64.node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-linux-arm64
+          path: tools/nodejs_api/prebuilt/kuzujs-linux-arm64.node
+
+  build-nodejs-mac-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Node.js addon
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: make nodejs NUM_THREADS=$(sysctl -n hw.ncpu)
+
+      - name: Rename prebuilt binary
+        run: |
+          mkdir -p tools/nodejs_api/prebuilt
+          cp tools/nodejs_api/build/kuzujs.node tools/nodejs_api/prebuilt/kuzujs-darwin-arm64.node
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-darwin-arm64
+          path: tools/nodejs_api/prebuilt/kuzujs-darwin-arm64.node
+
+  publish-npm:
+    needs: [build-nodejs-linux-x86, build-nodejs-linux-arm64, build-nodejs-mac-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com
+          scope: "@vela-engineering"
+
+      - name: Download all prebuilt binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: prebuilt-artifacts
+
+      - name: Package Node.js addon
+        working-directory: tools/nodejs_api
+        run: |
+          mkdir -p prebuilt
+          cp ../../prebuilt-artifacts/nodejs-linux-x64/kuzujs-linux-x64.node prebuilt/
+          cp ../../prebuilt-artifacts/nodejs-linux-arm64/kuzujs-linux-arm64.node prebuilt/
+          cp ../../prebuilt-artifacts/nodejs-darwin-arm64/kuzujs-darwin-arm64.node prebuilt/
+          node package.js
+
+      - name: Publish to GitHub Packages
+        working-directory: tools/nodejs_api/package
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ──────────────────────────────────────────────────
+  # GitHub Release
+  # ──────────────────────────────────────────────────
+  release:
+    needs:
+      - build-linux-x86-wheels
+      - build-linux-arm64-wheels
+      - build-mac-wheels
+      - publish-npm
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep -oP 'project\(Kuzu VERSION \K[0-9.]+' CMakeLists.txt)
+          SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "tag=v${VERSION}-vela.${SHA}" >> $GITHUB_OUTPUT
+          echo "name=Kuzu ${VERSION} (vela ${SHA})" >> $GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          pattern: '*-wheels'
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: nodejs-binaries
+          pattern: 'nodejs-*'
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.name }}
+          files: |
+            wheels/*.whl
+            nodejs-binaries/*.node
+          generate_release_notes: true
