@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-sdist:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -22,48 +22,66 @@ jobs:
           name: sdist
           path: ./scripts/pip-package/kuzu.tar.gz
 
-  build-linux-wheels:
+  build-linux-x86-wheels:
     needs: build-sdist
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: sdist
           path: ./scripts/pip-package
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22
         env:
-          CIBW_BUILD: "cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+          CIBW_BUILD: "cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
           CIBW_SKIP: "pp* *musllinux*"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
-          CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
-          CIBW_ARCHS_LINUX: "x86_64 aarch64"
+          CIBW_ARCHS_LINUX: "x86_64"
           CIBW_BEFORE_ALL: "yum install -y cmake ninja-build"
-          CIBW_ENVIRONMENT: "NUM_THREADS=2"
-          CIBW_BUILD_VERBOSITY: 3
+          CIBW_ENVIRONMENT: "NUM_THREADS=3"
+          CIBW_BUILD_VERBOSITY: 1
         with:
           package-dir: ./scripts/pip-package/kuzu.tar.gz
           output-dir: wheelhouse
 
       - uses: actions/upload-artifact@v4
         with:
-          name: linux-wheels
+          name: linux-x86-wheels
+          path: wheelhouse/*.whl
+
+  build-linux-arm64-wheels:
+    needs: build-sdist
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: ./scripts/pip-package
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.22
+        env:
+          CIBW_BUILD: "cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+          CIBW_SKIP: "pp* *musllinux*"
+          CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
+          CIBW_ARCHS_LINUX: "aarch64"
+          CIBW_BEFORE_ALL: "yum install -y cmake ninja-build"
+          CIBW_ENVIRONMENT: "NUM_THREADS=4"
+          CIBW_BUILD_VERBOSITY: 1
+        with:
+          package-dir: ./scripts/pip-package/kuzu.tar.gz
+          output-dir: wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64-wheels
           path: wheelhouse/*.whl
 
   build-mac-wheels:
     needs: build-sdist
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-
       - uses: actions/download-artifact@v4
         with:
           name: sdist
@@ -74,9 +92,8 @@ jobs:
         env:
           CIBW_BUILD: "cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64"
           CIBW_SKIP: "pp*"
-          CIBW_BEFORE_ALL: "brew install cmake ninja"
-          CIBW_ENVIRONMENT: "NUM_THREADS=4 MACOSX_DEPLOYMENT_TARGET=11.0"
-          CIBW_BUILD_VERBOSITY: 3
+          CIBW_ENVIRONMENT: "NUM_THREADS=3 MACOSX_DEPLOYMENT_TARGET=11.0"
+          CIBW_BUILD_VERBOSITY: 1
         with:
           package-dir: ./scripts/pip-package/kuzu.tar.gz
           output-dir: wheelhouse
@@ -87,8 +104,8 @@ jobs:
           path: wheelhouse/*.whl
 
   release:
-    needs: [build-linux-wheels, build-mac-wheels]
-    runs-on: ubuntu-latest
+    needs: [build-linux-x86-wheels, build-linux-arm64-wheels, build-mac-wheels]
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
