@@ -90,6 +90,17 @@ jobs:
           name: sdist
           path: ./scripts/pip-package
 
+      - name: Pre-download virtualenv for cibuildwheel
+        run: |
+          CACHE_DIR="$HOME/Library/Caches/cibuildwheel"
+          mkdir -p "$CACHE_DIR"
+          for i in 1 2 3 4 5; do
+            curl -fsSL -o "$CACHE_DIR/virtualenv-20.27.1.pyz" \
+              "https://github.com/pypa/get-virtualenv/blob/20.27.1/public/virtualenv.pyz?raw=true" && break
+            echo "Retry $i..."
+            sleep $((i * 5))
+          done
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22
         env:
@@ -97,7 +108,6 @@ jobs:
           CIBW_SKIP: "pp*"
           CIBW_ENVIRONMENT: "NUM_THREADS=3 MACOSX_DEPLOYMENT_TARGET=11.0"
           CIBW_BUILD_VERBOSITY: 1
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           package-dir: ./scripts/pip-package/kuzu.tar.gz
           output-dir: wheelhouse
@@ -121,6 +131,10 @@ jobs:
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Install Node.js API dependencies
+        working-directory: tools/nodejs_api
+        run: npm install --include=dev
 
       - name: Build Node.js addon
         run: make nodejs NUM_THREADS=$(nproc)
@@ -147,6 +161,10 @@ jobs:
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
 
+      - name: Install Node.js API dependencies
+        working-directory: tools/nodejs_api
+        run: npm install --include=dev
+
       - name: Build Node.js addon
         run: make nodejs NUM_THREADS=$(nproc)
 
@@ -168,6 +186,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
+      - name: Install Node.js API dependencies
+        working-directory: tools/nodejs_api
+        run: npm install --include=dev
 
       - name: Build Node.js addon
         env:
