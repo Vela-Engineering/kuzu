@@ -228,10 +228,15 @@ jobs:
           cp ../../prebuilt-artifacts/nodejs-linux-arm64/kuzujs-linux-arm64.node prebuilt/
           cp ../../prebuilt-artifacts/nodejs-darwin-arm64/kuzujs-darwin-arm64.node prebuilt/
           node package.js
+          tar -xzf kuzu-source.tar.gz
 
-      - name: Publish to GitHub Packages
-        working-directory: tools/nodejs_api
-        run: npm publish kuzu-source.tar.gz
+      - name: Set unique version and publish
+        working-directory: tools/nodejs_api/package
+        run: |
+          SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('package.json')).version)")
+          npm version "${VERSION}-vela.${SHA}" --no-git-tag-version
+          npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
