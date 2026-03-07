@@ -1,5 +1,5 @@
 {
-  "name": "kuzu",
+  "name": "@vela-engineering/kuzu",
   "version": "0.0.1",
   "description": "An in-process property graph database management system built for query speed and scalability.",
   "main": "index.js",
@@ -16,7 +16,10 @@
   "homepage": "https://kuzudb.com/",
   "repository": {
     "type": "git",
-    "url": "https://github.com/kuzudb/kuzu.git"
+    "url": "https://github.com/vela-engineering/kuzu.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
   },
   "scripts": {
     "test": "mocha test --timeout 20000",
