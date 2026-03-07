@@ -122,15 +122,12 @@ jobs:
   # ──────────────────────────────────────────────────
   build-nodejs-linux-x86:
     runs-on: ubuntu-24.04
+    container: node:20-bookworm
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+        run: apt-get update && apt-get install -y cmake ninja-build g++ make python3
 
       - name: Install Node.js API dependencies
         working-directory: tools/nodejs_api
@@ -151,15 +148,12 @@ jobs:
 
   build-nodejs-linux-arm64:
     runs-on: ubuntu-24.04-arm
+    container: node:20-bookworm
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+        run: apt-get update && apt-get install -y cmake ninja-build g++ make python3
 
       - name: Install Node.js API dependencies
         working-directory: tools/nodejs_api
