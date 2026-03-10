@@ -269,6 +269,139 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ──────────────────────────────────────────────────
+  # .NET / C# native wrapper (libkuzunet)
+  # ──────────────────────────────────────────────────
+  build-dotnet-linux-x86:
+    runs-on: ubuntu-24.04
+    container: mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y cmake ninja-build g++ make python3 swig
+
+      - name: Build kuzu + kuzunet
+        env:
+          LDFLAGS: "-static-libgcc -static-libstdc++"
+        run: |
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          unset LD_LIBRARY_PATH LIBRARY_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH PKG_CONFIG_PATH CC CXX
+          make dotnet NUM_THREADS=$(nproc) EXTRA_CMAKE_FLAGS="-DDOTNET_REGENERATE_SWIG=ON -DCMAKE_SHARED_LINKER_FLAGS='-static-libgcc -static-libstdc++'"
+
+      - name: Collect native binaries
+        run: |
+          mkdir -p dotnet-native/linux-x64
+          cp build/release/tools/dotnet_api/libkuzunet.so dotnet-native/linux-x64/
+          cp build/release/src/libkuzu.so dotnet-native/linux-x64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-linux-x64
+          path: dotnet-native/linux-x64/
+
+  build-dotnet-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    container: mcr.microsoft.com/dotnet/sdk:8.0-bookworm-slim
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: apt-get update && apt-get install -y cmake ninja-build g++ make python3 swig
+
+      - name: Build kuzu + kuzunet
+        env:
+          LDFLAGS: "-static-libgcc -static-libstdc++"
+        run: |
+          export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+          unset LD_LIBRARY_PATH LIBRARY_PATH CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH PKG_CONFIG_PATH CC CXX
+          make dotnet NUM_THREADS=$(nproc) EXTRA_CMAKE_FLAGS="-DDOTNET_REGENERATE_SWIG=ON -DCMAKE_SHARED_LINKER_FLAGS='-static-libgcc -static-libstdc++'"
+
+      - name: Collect native binaries
+        run: |
+          mkdir -p dotnet-native/linux-arm64
+          cp build/release/tools/dotnet_api/libkuzunet.so dotnet-native/linux-arm64/
+          cp build/release/src/libkuzu.so dotnet-native/linux-arm64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-linux-arm64
+          path: dotnet-native/linux-arm64/
+
+  build-dotnet-mac-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SWIG
+        run: brew install swig
+
+      - name: Build kuzu + kuzunet
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: make dotnet NUM_THREADS=$(sysctl -n hw.ncpu) EXTRA_CMAKE_FLAGS="-DDOTNET_REGENERATE_SWIG=ON"
+
+      - name: Collect native binaries
+        run: |
+          mkdir -p dotnet-native/osx-arm64
+          cp build/release/tools/dotnet_api/libkuzunet.dylib dotnet-native/osx-arm64/
+          cp build/release/src/libkuzu.dylib dotnet-native/osx-arm64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-osx-arm64
+          path: dotnet-native/osx-arm64/
+
+  publish-nuget:
+    needs: [build-dotnet-linux-x86, build-dotnet-linux-arm64, build-dotnet-mac-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Download all native binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dotnet-artifacts
+
+      - name: Assemble NuGet runtime directories
+        working-directory: tools/dotnet_api/src/Kuzu.Net
+        run: |
+          mkdir -p runtimes/linux-x64/native runtimes/linux-arm64/native runtimes/osx-arm64/native
+          cp ../../../../dotnet-artifacts/dotnet-linux-x64/* runtimes/linux-x64/native/
+          cp ../../../../dotnet-artifacts/dotnet-linux-arm64/* runtimes/linux-arm64/native/
+          cp ../../../../dotnet-artifacts/dotnet-osx-arm64/* runtimes/osx-arm64/native/
+          echo "=== Native runtimes ==="
+          find runtimes -type f | sort
+
+      - name: Pack NuGet
+        working-directory: tools/dotnet_api/src/Kuzu.Net
+        run: |
+          SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          VERSION=$(grep -oP 'project\(Kuzu VERSION \K[0-9.]+' ../../../../CMakeLists.txt)
+          dotnet pack -c Release -p:Version="${VERSION}-vela.${SHA}"
+
+      - name: Publish to GitHub Packages
+        working-directory: tools/dotnet_api/src/Kuzu.Net
+        run: |
+          dotnet nuget push bin/Release/*.nupkg \
+            --source "https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json" \
+            --api-key ${{ secrets.GITHUB_TOKEN }} \
+            --skip-duplicate
+        env:
+          DOTNET_SYSTEM_NET_HTTP_USESOCKETSHTTPHANDLER: 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dotnet-nuget
+          path: tools/dotnet_api/src/Kuzu.Net/bin/Release/*.nupkg
+
+  # ──────────────────────────────────────────────────
   # GitHub Release
   # ──────────────────────────────────────────────────
   release:
@@ -277,6 +410,7 @@ jobs:
       - build-linux-arm64-wheels
       - build-mac-wheels
       - publish-npm
+      - publish-nuget
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -303,6 +437,12 @@ jobs:
           pattern: 'nodejs-*'
           merge-multiple: true
 
+      - uses: actions/download-artifact@v4
+        with:
+          path: dotnet-packages
+          pattern: 'dotnet-nuget'
+          merge-multiple: true
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -311,4 +451,5 @@ jobs:
           files: |
             wheels/*.whl
             nodejs-binaries/*.node
+            dotnet-packages/*.nupkg
           generate_release_notes: true
