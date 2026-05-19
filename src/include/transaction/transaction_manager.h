@@ -1,5 +1,6 @@
 #pragma once
 
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 
@@ -49,15 +50,10 @@ public:
     static TransactionManager* Get(const main::ClientContext& context);
 
 private:
-    bool hasNoActiveTransactions() const;
     void checkpointNoLock(main::ClientContext& clientContext);
     // Try to checkpoint without blocking. Returns immediately if another checkpoint is in
     // progress. Used by auto-checkpoint after commit.
     void tryCheckpoint(main::ClientContext& clientContext);
-
-    // This function locks the mutex to stop new transactions and waits until all transactions
-    // (both read and write) leave the system. Used as a fallback.
-    common::UniqLock stopNewTransactionsAndWaitUntilAllTransactionsLeave();
 
     // This function locks the mutex to stop new write transactions and waits until all active
     // write transactions leave the system. Read transactions are allowed to continue, as
@@ -67,6 +63,8 @@ private:
     bool hasActiveWriteTransactionNoLock() const {
         return activeWriteTransactionCount.load(std::memory_order_acquire) > 0;
     }
+
+    void decrementActiveWriteTransactionCount();
 
     // Note: Used by DBTest::createDB only.
     void setCheckPointWaitTimeoutForTransactionsToLeaveInMicros(uint64_t waitTimeInMicros) {
@@ -86,8 +84,11 @@ private:
     // Prevents concurrent checkpoints. Separate from mtxForSerializingPublicFunctionCalls so
     // that active writers can commit/rollback while the checkpoint is draining them.
     std::mutex mtxForCheckpoint;
-    // Atomic counter tracking active write/recovery transactions so the checkpoint drain loop
-    // can poll without holding mtxForSerializingPublicFunctionCalls (which would deadlock).
+    // protects condition-variable waits for active write transactions to reach zero.
+    std::mutex mtxForActiveWriteTransactions;
+    std::condition_variable cvActiveWriteTransactionsChanged;
+    // active write/recovery transaction count used by checkpoint drain waits without holding
+    // mtxForSerializingPublicFunctionCalls, which would deadlock.
     std::atomic<uint32_t> activeWriteTransactionCount{0};
     uint64_t checkpointWaitTimeoutInMicros = common::DEFAULT_CHECKPOINT_WAIT_TIMEOUT_IN_MICROS;
 

@@ -1,7 +1,5 @@
 #include "transaction/transaction_manager.h"
 
-#include <thread>
-
 #include "common/exception/checkpoint.h"
 #include "common/exception/transaction_manager.h"
 #include "main/attached_database.h"
@@ -19,13 +17,13 @@ namespace transaction {
 
 Transaction* TransactionManager::beginTransaction(main::ClientContext& clientContext,
     TransactionType type) {
-    std::unique_lock publicFunctionLck{mtxForSerializingPublicFunctionCalls};
-    // Only acquire the write gate for write/recovery transactions. Read-only transactions
+    // only acquire the write gate for write/recovery transactions. Read-only transactions
     // can start freely during checkpoint since they use snapshot isolation.
     std::unique_lock newTransactionLck{mtxForStartingNewTransactions, std::defer_lock};
     if (type != TransactionType::READ_ONLY) {
         newTransactionLck.lock();
     }
+    std::unique_lock publicFunctionLck{mtxForSerializingPublicFunctionCalls};
     switch (type) {
     case TransactionType::READ_ONLY: {
         auto transaction =
@@ -35,7 +33,8 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
     }
     case TransactionType::RECOVERY:
     case TransactionType::WRITE: {
-        if (!clientContext.getDBConfig()->enableMultiWrites && hasActiveWriteTransactionNoLock()) {
+        if (!clientContext.getDBConfig()->experimentalConcurrentWrites &&
+            hasActiveWriteTransactionNoLock()) {
             throw TransactionManagerException(
                 "Cannot start a new write transaction in the system. "
                 "Only one write transaction at a time is allowed in the system.");
@@ -45,8 +44,8 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
         if (transaction->shouldLogToWAL()) {
             transaction->getLocalWAL().logBeginTransaction();
         }
-        activeWriteTransactionCount.fetch_add(1, std::memory_order_release);
         activeTransactions.push_back(std::move(transaction));
+        activeWriteTransactionCount.fetch_add(1, std::memory_order_release);
         return activeTransactions.back().get();
     }
         // LCOV_EXCL_START
@@ -74,7 +73,7 @@ void TransactionManager::commit(main::ClientContext& clientContext, Transaction*
             shouldCheckpoint = transaction->shouldForceCheckpoint() ||
                                Checkpointer::canAutoCheckpoint(clientContext, *transaction);
             clearTransactionNoLock(transaction->getID());
-            activeWriteTransactionCount.fetch_sub(1, std::memory_order_release);
+            decrementActiveWriteTransactionCount();
         } break;
             // LCOV_EXCL_START
         default: {
@@ -104,7 +103,7 @@ void TransactionManager::rollback(main::ClientContext& clientContext, Transactio
     case TransactionType::WRITE: {
         transaction->rollback(&wal);
         clearTransactionNoLock(transaction->getID());
-        activeWriteTransactionCount.fetch_sub(1, std::memory_order_release);
+        decrementActiveWriteTransactionCount();
     } break;
     default: {
         throw TransactionManagerException("Invalid transaction type to rollback.");
@@ -124,55 +123,30 @@ void TransactionManager::checkpoint(main::ClientContext& clientContext) {
 
 TransactionManager* TransactionManager::Get(const main::ClientContext& context) {
     if (context.getAttachedDatabase() != nullptr) {
-        context.getAttachedDatabase()->getTransactionManager();
+        return context.getAttachedDatabase()->getTransactionManager();
     }
     return context.getDatabase()->getTransactionManager();
 }
 
-UniqLock TransactionManager::stopNewTransactionsAndWaitUntilAllTransactionsLeave() {
-    UniqLock startTransactionLock{mtxForStartingNewTransactions};
-    uint64_t numTimesWaited = 0;
-    while (true) {
-        if (hasNoActiveTransactions()) {
-            break;
-        }
-        numTimesWaited++;
-        if (numTimesWaited * THREAD_SLEEP_TIME_WHEN_WAITING_IN_MICROS >
-            checkpointWaitTimeoutInMicros) {
-            throw TransactionManagerException(
-                "Timeout waiting for active transactions to leave the system before "
-                "checkpointing. If you have an open transaction, please close it and try "
-                "again.");
-        }
-        std::this_thread::sleep_for(
-            std::chrono::microseconds(THREAD_SLEEP_TIME_WHEN_WAITING_IN_MICROS));
-    }
-    return startTransactionLock;
-}
-
 UniqLock TransactionManager::stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave() {
     UniqLock startTransactionLock{mtxForStartingNewTransactions};
-    uint64_t numTimesWaited = 0;
-    while (true) {
-        if (!hasActiveWriteTransactionNoLock()) {
-            break;
-        }
-        numTimesWaited++;
-        if (numTimesWaited * THREAD_SLEEP_TIME_WHEN_WAITING_IN_MICROS >
-            checkpointWaitTimeoutInMicros) {
-            throw TransactionManagerException(
-                "Timeout waiting for active write transactions to leave the system before "
-                "checkpointing. If you have an open write transaction, please close it and "
-                "try again.");
-        }
-        std::this_thread::sleep_for(
-            std::chrono::microseconds(THREAD_SLEEP_TIME_WHEN_WAITING_IN_MICROS));
+    std::unique_lock activeWriteTransactionsLck{mtxForActiveWriteTransactions};
+    const auto timeout = std::chrono::microseconds(checkpointWaitTimeoutInMicros);
+    if (!cvActiveWriteTransactionsChanged.wait_for(activeWriteTransactionsLck, timeout,
+            [&]() { return !hasActiveWriteTransactionNoLock(); })) {
+        throw TransactionManagerException(
+            "Timeout waiting for active write transactions to leave the system before "
+            "checkpointing. If you have an open write transaction, please close it and "
+            "try again.");
     }
     return startTransactionLock;
 }
 
-bool TransactionManager::hasNoActiveTransactions() const {
-    return activeTransactions.empty();
+void TransactionManager::decrementActiveWriteTransactionCount() {
+    if (activeWriteTransactionCount.fetch_sub(1, std::memory_order_release) == 1) {
+        std::lock_guard activeWriteTransactionsLck{mtxForActiveWriteTransactions};
+        cvActiveWriteTransactionsChanged.notify_all();
+    }
 }
 
 void TransactionManager::clearTransactionNoLock(transaction_t transactionID) {

@@ -59,7 +59,7 @@ struct DBConfig {
     bool enableCompression;
     bool readOnly;
     uint64_t maxDBSize;
-    bool enableMultiWrites;
+    bool experimentalConcurrentWrites;
     bool autoCheckpoint;
     uint64_t checkpointThreshold;
     bool forceCheckpointOnClose;

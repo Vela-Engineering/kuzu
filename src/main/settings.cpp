@@ -139,14 +139,14 @@ common::Value RecursivePatternFactorSetting::getSetting(const ClientContext* con
         context->getClientConfig()->recursivePatternCardinalityScaleFactor);
 }
 
-void EnableMVCCSetting::setContext(ClientContext* context, const common::Value& parameter) {
-    KU_ASSERT(parameter.getDataType().getLogicalTypeID() == common::LogicalTypeID::BOOL);
-    // TODO: This is a temporary solution to make tests of multiple write transactions easier.
-    context->getDBConfigUnsafe()->enableMultiWrites = parameter.getValue<bool>();
+void ExperimentalConcurrentWritesSetting::setContext(ClientContext* context,
+    const common::Value& parameter) {
+    parameter.validateType(inputType);
+    context->getDBConfigUnsafe()->experimentalConcurrentWrites = parameter.getValue<bool>();
 }
 
-common::Value EnableMVCCSetting::getSetting(const ClientContext* context) {
-    return common::Value(context->getDBConfig()->enableMultiWrites);
+common::Value ExperimentalConcurrentWritesSetting::getSetting(const ClientContext* context) {
+    return common::Value(context->getDBConfig()->experimentalConcurrentWrites);
 }
 
 void CheckpointThresholdSetting::setContext(ClientContext* context,

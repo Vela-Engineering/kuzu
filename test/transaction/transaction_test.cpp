@@ -2,8 +2,10 @@
 
 #include "api_test/api_test.h"
 #include "api_test/private_api_test.h"
+#include "main/attached_database.h"
 #include "storage/storage_utils.h"
 #include "storage/wal/wal.h"
+#include "transaction/transaction_manager.h"
 
 using namespace kuzu::common;
 using namespace kuzu::testing;
@@ -133,6 +135,29 @@ TEST_F(EmptyDBTransactionTest, DatabaseFilesAfterCheckpoint) {
     conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
 }
 
+TEST_F(EmptyDBTransactionTest, GetsAttachedDatabaseTransactionManager) {
+    const auto attachedDatabasePath =
+        TestHelper::getTempDBPathStr(getTestGroupAndName() + ".attached");
+    removeParentDirectoryOfDBPath(attachedDatabasePath);
+    {
+        auto attachedDatabase =
+            std::make_unique<kuzu::main::Database>(attachedDatabasePath, *systemConfig);
+    }
+    auto result = conn->query(
+        stringFormat("ATTACH '{}' AS remote (DBTYPE KUZU);", attachedDatabasePath));
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+
+    auto context = getClientContext(*conn);
+    ASSERT_NE(context->getAttachedDatabase(), nullptr);
+    ASSERT_EQ(TransactionManager::Get(*context),
+        context->getAttachedDatabase()->getTransactionManager());
+    ASSERT_NE(TransactionManager::Get(*context), database->getTransactionManager());
+
+    result = conn->query("DETACH remote;");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    removeParentDirectoryOfDBPath(attachedDatabasePath);
+}
+
 #ifndef __SINGLE_THREADED__
 static void insertNodes(uint64_t startID, uint64_t num, kuzu::main::Database& database) {
     auto conn = std::make_unique<kuzu::main::Connection>(&database);
@@ -148,7 +173,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentNodeInsertions) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numInsertsPerThread = 1000;
     conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
@@ -192,7 +217,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentNodeInsertionsMixedTypes) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numInsertsPerThread = 1000;
     conn->query("CREATE NODE TABLE mixed_test(id INT64 PRIMARY KEY, score DOUBLE, active BOOLEAN, "
@@ -238,7 +263,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentRelationshipInsertions) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numInsertsPerThread = 2000;
     auto numTotalInsertions = numThreads * numInsertsPerThread;
@@ -298,7 +323,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentComplexRelationshipInsertions) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 3;
     auto numInsertsPerThread = 1500;
     auto numTotalInsertions = numThreads * numInsertsPerThread;
@@ -358,7 +383,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentNodeUpdates) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numUpdatesPerThread = 3000;
     auto numTotalNodes = numThreads * numUpdatesPerThread;
@@ -416,7 +441,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentMixedTypeUpdates) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numUpdatesPerThread = 2500;
     auto numTotalNodes = numThreads * numUpdatesPerThread;
@@ -493,7 +518,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentRelationshipUpdates) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numUpdatesPerThread = 1500;
     auto numTotalUpdates = numThreads * numUpdatesPerThread;
@@ -568,7 +593,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentNodeUpdatesWithMixedTransactions) {
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numUpdatesPerThread = 100;
     auto numTotalNodes = numThreads * numUpdatesPerThread;
@@ -640,7 +665,7 @@ TEST_F(EmptyDBTransactionTest, ConcurrentRelationshipUpdatesWithMixedTransaction
     if (systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
-    conn->query("CALL debug_enable_multi_writes=true;");
+    conn->query("CALL experimental_concurrent_writes=true;");
     auto numThreads = 4;
     auto numUpdatesPerThread = 1000;
     auto numTotalUpdates = numThreads * numUpdatesPerThread;
