@@ -1,8 +1,11 @@
 #pragma once
 
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
 
 #include "common/constants.h"
 #include "common/uniq_lock.h"
@@ -13,6 +16,7 @@
 namespace kuzu {
 namespace main {
 class ClientContext;
+class Database;
 } // namespace main
 
 namespace testing {
@@ -39,6 +43,7 @@ public:
         : wal{wal}, lastTransactionID{Transaction::START_TRANSACTION_ID}, lastTimestamp{1} {
         initCheckpointerFunc = initCheckpointer;
     }
+    ~TransactionManager();
 
     Transaction* beginTransaction(main::ClientContext& clientContext, TransactionType type);
 
@@ -46,14 +51,21 @@ public:
     void rollback(main::ClientContext& clientContext, Transaction* transaction);
 
     void checkpoint(main::ClientContext& clientContext);
+    // Shuts down the background auto-checkpoint worker before database teardown.
+    void shutdownAutoCheckpointWorker();
+    // Returns the last background auto-checkpoint error, or an empty string if the last run
+    // succeeded.
+    std::string getLastAutoCheckpointErrorMessage();
 
     static TransactionManager* Get(const main::ClientContext& context);
 
 private:
     void checkpointNoLock(main::ClientContext& clientContext);
-    // Try to checkpoint without blocking. Returns immediately if another checkpoint is in
-    // progress. Used by auto-checkpoint after commit.
-    void tryCheckpoint(main::ClientContext& clientContext);
+    void scheduleAutoCheckpoint(main::ClientContext& clientContext);
+    void runAutoCheckpointWorker(main::Database* database);
+    bool shouldRunAutoCheckpoint(main::ClientContext& clientContext) const;
+    void clearAutoCheckpointErrorMessage();
+    void setAutoCheckpointErrorMessage(std::string errorMessage);
 
     // This function locks the mutex to stop new write transactions and waits until all active
     // write transactions leave the system. Read transactions are allowed to continue, as
@@ -72,6 +84,7 @@ private:
     }
 
     void clearTransactionNoLock(common::transaction_t transactionID);
+    void setInitCheckpointerFuncForTesting(init_checkpointer_func_t initFunc);
 
 private:
     storage::WAL& wal;
@@ -92,6 +105,14 @@ private:
     std::atomic<uint32_t> activeWriteTransactionCount{0};
     uint64_t checkpointWaitTimeoutInMicros = common::DEFAULT_CHECKPOINT_WAIT_TIMEOUT_IN_MICROS;
 
+    std::mutex mtxForAutoCheckpoint;
+    std::condition_variable cvAutoCheckpoint;
+    std::thread autoCheckpointWorker;
+    bool autoCheckpointRequested = false;
+    bool stopAutoCheckpointWorker = false;
+    std::string lastAutoCheckpointErrorMessage;
+
+    std::mutex mtxForInitCheckpointerFunc;
     init_checkpointer_func_t initCheckpointerFunc;
 };
 } // namespace transaction

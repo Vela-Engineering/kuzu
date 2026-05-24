@@ -15,6 +15,10 @@ using namespace kuzu::storage;
 namespace kuzu {
 namespace transaction {
 
+TransactionManager::~TransactionManager() {
+    shutdownAutoCheckpointWorker();
+}
+
 Transaction* TransactionManager::beginTransaction(main::ClientContext& clientContext,
     TransactionType type) {
     // only acquire the write gate for write/recovery transactions. Read-only transactions
@@ -57,7 +61,8 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
 }
 
 void TransactionManager::commit(main::ClientContext& clientContext, Transaction* transaction) {
-    bool shouldCheckpoint = false;
+    bool shouldForceCheckpoint = false;
+    bool shouldAutoCheckpoint = false;
     {
         std::unique_lock lck{mtxForSerializingPublicFunctionCalls};
         clientContext.cleanUp();
@@ -70,8 +75,10 @@ void TransactionManager::commit(main::ClientContext& clientContext, Transaction*
             lastTimestamp++;
             transaction->commitTS = lastTimestamp;
             transaction->commit(&wal);
-            shouldCheckpoint = transaction->shouldForceCheckpoint() ||
-                               Checkpointer::canAutoCheckpoint(clientContext, *transaction);
+            shouldForceCheckpoint = transaction->shouldForceCheckpoint();
+            if (!shouldForceCheckpoint) {
+                shouldAutoCheckpoint = Checkpointer::canAutoCheckpoint(clientContext, *transaction);
+            }
             clearTransactionNoLock(transaction->getID());
             decrementActiveWriteTransactionCount();
         } break;
@@ -84,8 +91,10 @@ void TransactionManager::commit(main::ClientContext& clientContext, Transaction*
     }
     // Checkpoint outside the public function lock so active writers can finish
     // (commit/rollback) during the drain phase instead of deadlocking.
-    if (shouldCheckpoint) {
-        tryCheckpoint(clientContext);
+    if (shouldForceCheckpoint) {
+        checkpoint(clientContext);
+    } else if (shouldAutoCheckpoint) {
+        scheduleAutoCheckpoint(clientContext);
     }
 }
 
@@ -164,15 +173,96 @@ std::unique_ptr<Checkpointer> TransactionManager::initCheckpointer(
     return std::make_unique<Checkpointer>(clientContext);
 }
 
-void TransactionManager::tryCheckpoint(main::ClientContext& clientContext) {
+void TransactionManager::setInitCheckpointerFuncForTesting(init_checkpointer_func_t initFunc) {
+    std::lock_guard lck{mtxForInitCheckpointerFunc};
+    initCheckpointerFunc = std::move(initFunc);
+}
+
+void TransactionManager::scheduleAutoCheckpoint(main::ClientContext& clientContext) {
+    if (clientContext.getAttachedDatabase() != nullptr) {
+        checkpoint(clientContext);
+        return;
+    }
+    std::unique_lock lck{mtxForAutoCheckpoint};
+    if (stopAutoCheckpointWorker) {
+        return;
+    }
+    autoCheckpointRequested = true;
+    if (!autoCheckpointWorker.joinable()) {
+        auto database = clientContext.getDatabase();
+        autoCheckpointWorker = std::thread(
+            [this, database]() { runAutoCheckpointWorker(database); });
+    }
+    lck.unlock();
+    cvAutoCheckpoint.notify_one();
+}
+
+void TransactionManager::runAutoCheckpointWorker(main::Database* database) {
+    while (true) {
+        {
+            std::unique_lock lck{mtxForAutoCheckpoint};
+            cvAutoCheckpoint.wait(lck,
+                [&]() { return autoCheckpointRequested || stopAutoCheckpointWorker; });
+            if (stopAutoCheckpointWorker) {
+                return;
+            }
+            autoCheckpointRequested = false;
+        }
+        try {
+            main::ClientContext checkpointContext(database);
+            if (shouldRunAutoCheckpoint(checkpointContext)) {
+                std::unique_lock checkpointLck{mtxForCheckpoint};
+                if (shouldRunAutoCheckpoint(checkpointContext)) {
+                    checkpointNoLock(checkpointContext);
+                }
+            }
+            clearAutoCheckpointErrorMessage();
+        } catch (std::exception& e) {
+            setAutoCheckpointErrorMessage(e.what());
+        } catch (...) {
+            setAutoCheckpointErrorMessage("Unknown auto-checkpoint failure.");
+        }
+    }
+}
+
+bool TransactionManager::shouldRunAutoCheckpoint(main::ClientContext& clientContext) const {
     if (clientContext.isInMemory()) {
-        return;
+        return false;
     }
-    std::unique_lock checkpointLck{mtxForCheckpoint, std::try_to_lock};
-    if (!checkpointLck.owns_lock()) {
-        return;
+    if (!clientContext.getDBConfig()->autoCheckpoint) {
+        return false;
     }
-    checkpointNoLock(clientContext);
+    return WAL::Get(clientContext)->getFileSize() >
+           clientContext.getDBConfig()->checkpointThreshold;
+}
+
+void TransactionManager::clearAutoCheckpointErrorMessage() {
+    std::lock_guard lck{mtxForAutoCheckpoint};
+    lastAutoCheckpointErrorMessage.clear();
+}
+
+void TransactionManager::setAutoCheckpointErrorMessage(std::string errorMessage) {
+    std::lock_guard lck{mtxForAutoCheckpoint};
+    lastAutoCheckpointErrorMessage = std::move(errorMessage);
+}
+
+std::string TransactionManager::getLastAutoCheckpointErrorMessage() {
+    std::lock_guard lck{mtxForAutoCheckpoint};
+    return lastAutoCheckpointErrorMessage;
+}
+
+void TransactionManager::shutdownAutoCheckpointWorker() {
+    std::thread worker;
+    {
+        std::lock_guard lck{mtxForAutoCheckpoint};
+        stopAutoCheckpointWorker = true;
+        autoCheckpointRequested = false;
+        worker = std::move(autoCheckpointWorker);
+    }
+    cvAutoCheckpoint.notify_one();
+    if (worker.joinable()) {
+        worker.join();
+    }
 }
 
 void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
@@ -189,7 +279,12 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     } catch (std::exception& e) {
         throw CheckpointException{e};
     }
-    auto checkpointer = initCheckpointerFunc(clientContext);
+    init_checkpointer_func_t initFunc;
+    {
+        std::lock_guard initFuncLck{mtxForInitCheckpointerFunc};
+        initFunc = initCheckpointerFunc;
+    }
+    auto checkpointer = initFunc(clientContext);
     try {
         checkpointer->beginCheckpoint(lastTimestamp);
     } catch (std::exception& e) {

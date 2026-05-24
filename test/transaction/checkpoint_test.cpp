@@ -1,7 +1,12 @@
+#include <chrono>
+#include <condition_variable>
 #include <fstream>
+#include <future>
+#include <limits>
 
 #include "api_test/private_api_test.h"
 #include "common/exception/runtime.h"
+#include "main/connection.h"
 #include "storage/checkpointer.h"
 #include "storage/storage_manager.h"
 #include "storage/wal/wal.h"
@@ -21,11 +26,111 @@ public:
         : initFunc(std::move(initFunc)) {}
 
     void setCheckpointer(main::ClientContext& context) const {
-        TransactionManager::Get(context)->initCheckpointerFunc = initFunc;
+        TransactionManager::Get(context)->setInitCheckpointerFuncForTesting(initFunc);
     }
 
 private:
     TransactionManager::init_checkpointer_func_t initFunc;
+};
+
+class BlockingCheckpointState {
+public:
+    uint64_t markEntered() {
+        uint64_t checkpointIdx;
+        {
+            std::lock_guard lck{mtx};
+            checkpointIdx = ++enteredCount;
+        }
+        cv.notify_all();
+        return checkpointIdx;
+    }
+
+    void release() {
+        {
+            std::lock_guard lck{mtx};
+            releasedCount = std::numeric_limits<uint64_t>::max();
+        }
+        cv.notify_all();
+    }
+
+    void releaseNext() {
+        {
+            std::lock_guard lck{mtx};
+            releasedCount++;
+        }
+        cv.notify_all();
+    }
+
+    void waitUntilReleased(uint64_t checkpointIdx) {
+        std::unique_lock lck{mtx};
+        cv.wait(lck, [&]() { return releasedCount >= checkpointIdx; });
+    }
+
+    void markFinished() {
+        {
+            std::lock_guard lck{mtx};
+            finishedCount++;
+        }
+        cv.notify_all();
+    }
+
+    bool waitUntilEntered(std::chrono::seconds timeout) {
+        return waitUntilEnteredCount(1, timeout);
+    }
+
+    bool waitUntilEnteredCount(uint64_t count, std::chrono::seconds timeout) {
+        std::unique_lock lck{mtx};
+        return cv.wait_for(lck, timeout, [&]() { return enteredCount >= count; });
+    }
+
+    bool waitUntilFinished(std::chrono::seconds timeout) {
+        return waitUntilFinishedCount(1, timeout);
+    }
+
+    bool waitUntilFinishedCount(uint64_t count, std::chrono::seconds timeout) {
+        std::unique_lock lck{mtx};
+        return cv.wait_for(lck, timeout, [&]() { return finishedCount >= count; });
+    }
+
+private:
+    std::mutex mtx;
+    std::condition_variable cv;
+    uint64_t enteredCount = 0;
+    uint64_t releasedCount = 0;
+    uint64_t finishedCount = 0;
+};
+
+class BlockingCheckpointReleaseGuard {
+public:
+    explicit BlockingCheckpointReleaseGuard(std::shared_ptr<BlockingCheckpointState> state)
+        : state{std::move(state)} {}
+
+    ~BlockingCheckpointReleaseGuard() {
+        if (state) {
+            state->release();
+        }
+    }
+
+private:
+    std::shared_ptr<BlockingCheckpointState> state;
+};
+
+class BlockingCheckpointer final : public Checkpointer {
+public:
+    BlockingCheckpointer(main::ClientContext& clientContext,
+        std::shared_ptr<BlockingCheckpointState> state)
+        : Checkpointer(clientContext), state{std::move(state)} {}
+
+    bool checkpointStorage() override {
+        const auto checkpointIdx = state->markEntered();
+        state->waitUntilReleased(checkpointIdx);
+        const auto result = Checkpointer::checkpointStorage();
+        state->markFinished();
+        return result;
+    }
+
+private:
+    std::shared_ptr<BlockingCheckpointState> state;
 };
 
 class FlakyCheckpointerTest : public PrivateApiTest {
@@ -71,6 +176,79 @@ TEST_F(FlakyCheckpointerTest, RecoverFromCheckpointStorageFailure) {
     };
     FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
     runTest(flakyCheckpointer);
+}
+
+TEST_F(FlakyCheckpointerTest, AutoCheckpointRunsInBackground) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=true;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL checkpoint_threshold=1;")->isSuccess());
+
+    auto state = std::make_shared<BlockingCheckpointState>();
+    auto initBlockingCheckpointer = [state](main::ClientContext& context) {
+        return std::make_unique<BlockingCheckpointer>(context, state);
+    };
+    FlakyCheckpointer blockingCheckpointer(initBlockingCheckpointer);
+    blockingCheckpointer.setCheckpointer(*getClientContext(*conn));
+
+    auto queryFuture = std::async(std::launch::async,
+        [&]() { return conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);"); });
+    BlockingCheckpointReleaseGuard releaseGuard{state};
+
+    const auto queryStatus = queryFuture.wait_for(std::chrono::seconds(5));
+    if (queryStatus != std::future_status::ready) {
+        state->release();
+        FAIL() << "auto-checkpoint blocked the committing query";
+    }
+    auto result = queryFuture.get();
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+
+    if (!state->waitUntilEntered(std::chrono::seconds(5))) {
+        state->release();
+        FAIL() << "auto-checkpoint was not scheduled";
+    }
+    state->release();
+    ASSERT_TRUE(state->waitUntilFinished(std::chrono::seconds(5)));
+}
+
+TEST_F(FlakyCheckpointerTest, AutoCheckpointWaitsForActiveCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL checkpoint_threshold=1;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE seed(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=true;")->isSuccess());
+
+    auto state = std::make_shared<BlockingCheckpointState>();
+    auto initBlockingCheckpointer = [state](main::ClientContext& context) {
+        return std::make_unique<BlockingCheckpointer>(context, state);
+    };
+    FlakyCheckpointer blockingCheckpointer(initBlockingCheckpointer);
+    blockingCheckpointer.setCheckpointer(*getClientContext(*conn));
+
+    auto manualCheckpointFuture =
+        std::async(std::launch::async, [&]() { return conn->query("CHECKPOINT;"); });
+    BlockingCheckpointReleaseGuard releaseGuard{state};
+    ASSERT_TRUE(state->waitUntilEnteredCount(1, std::chrono::seconds(5)));
+
+    auto writerConn = std::make_unique<main::Connection>(database.get());
+    auto writeResult = writerConn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);");
+    ASSERT_TRUE(writeResult->isSuccess()) << writeResult->getErrorMessage();
+
+    state->releaseNext();
+    ASSERT_TRUE(state->waitUntilEnteredCount(2, std::chrono::seconds(5)));
+    state->releaseNext();
+    ASSERT_TRUE(state->waitUntilFinishedCount(2, std::chrono::seconds(5)));
+
+    ASSERT_EQ(manualCheckpointFuture.wait_for(std::chrono::seconds(5)),
+        std::future_status::ready);
+    auto manualCheckpointResult = manualCheckpointFuture.get();
+    ASSERT_TRUE(manualCheckpointResult->isSuccess())
+        << manualCheckpointResult->getErrorMessage();
 }
 
 class FlakyCheckpointerFailsOnSerialization final : public Checkpointer {

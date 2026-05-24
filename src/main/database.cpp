@@ -138,6 +138,7 @@ void Database::initMembers(std::string_view dbPath, construct_bm_func_t initBmFu
 }
 
 Database::~Database() {
+    transactionManager->shutdownAutoCheckpointWorker();
     if (!dbConfig.readOnly && dbConfig.forceCheckpointOnClose) {
         try {
             ClientContext clientContext(this);
