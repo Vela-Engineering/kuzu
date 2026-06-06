@@ -317,11 +317,18 @@ TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
     auto checkpointResult = checkpointFuture.get();
     ASSERT_FALSE(checkpointResult->isSuccess());
 
-    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
     ASSERT_TRUE(std::filesystem::exists(StorageUtils::getWALFilePath(databasePath)));
+    const auto frozenWalSize = std::filesystem::file_size(frozenWalPath);
+    auto retryCheckpointResult = conn->query("CHECKPOINT;");
+    ASSERT_FALSE(retryCheckpointResult->isSuccess());
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_EQ(std::filesystem::file_size(frozenWalPath), frozenWalSize);
 
     writeResult.reset();
     checkpointResult.reset();
+    retryCheckpointResult.reset();
     writerConn.reset();
     conn.reset();
     database.reset();

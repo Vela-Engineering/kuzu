@@ -2,8 +2,8 @@
 
 #include <unordered_map>
 
-#include "common/uniq_lock.h"
 #include "common/types/types.h"
+#include "common/uniq_lock.h"
 #include "storage/database_header.h"
 #include "storage/page_range.h"
 

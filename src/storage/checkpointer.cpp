@@ -1,9 +1,9 @@
 #include "storage/checkpointer.h"
 
 #include "catalog/catalog.h"
+#include "common/exception/runtime.h"
 #include "common/file_system/file_system.h"
 #include "common/file_system/virtual_file_system.h"
-#include "common/exception/runtime.h"
 #include "common/serializer/buffered_file.h"
 #include "common/serializer/deserializer.h"
 #include "common/serializer/in_mem_file_writer.h"
@@ -152,7 +152,8 @@ void Checkpointer::finishCheckpoint() {
     }
     if (snapshotInvalidatedByConcurrentWrite) {
         throw common::RuntimeException(
-            "Checkpoint snapshot was invalidated by a concurrent write; retry checkpoint.");
+            "Checkpoint snapshot was invalidated by a concurrent write. Restart the database "
+            "before retrying checkpoint.");
     }
     serializeCatalogAndMetadata(checkpointHeader, hasStorageChanges);
     writeDatabaseHeader(checkpointHeader);
@@ -198,8 +199,9 @@ bool Checkpointer::checkpointStorage() {
     auto pageAllocator = storageManager->getDataFH()->getPageManager();
     if (snapshotTS > 0) {
         if (walRotated) {
-            storageCheckpointWriteGate = transaction::TransactionManager::Get(clientContext)
-                                             ->stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
+            auto transactionManager = transaction::TransactionManager::Get(clientContext);
+            storageCheckpointWriteGate =
+                transactionManager->stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
             if (!snapshotTableEpochsStillValid()) {
                 snapshotInvalidatedByConcurrentWrite = true;
                 return false;
