@@ -133,6 +133,37 @@ private:
     std::shared_ptr<BlockingCheckpointState> state;
 };
 
+class BlockingCheckpointerFailsOnApplyingShadow final : public Checkpointer {
+public:
+    BlockingCheckpointerFailsOnApplyingShadow(main::ClientContext& clientContext,
+        std::shared_ptr<BlockingCheckpointState> state)
+        : Checkpointer(clientContext), state{std::move(state)} {}
+
+    bool checkpointStorage() override {
+        const auto checkpointIdx = state->markEntered();
+        state->waitUntilReleased(checkpointIdx);
+        const auto result = Checkpointer::checkpointStorage();
+        state->markFinished();
+        return result;
+    }
+
+    void logCheckpointAndApplyShadowPages(bool walRotated) override {
+        const auto storageManager = StorageManager::Get(clientContext);
+        auto& shadowFile = storageManager->getShadowFile();
+        shadowFile.flushAll(clientContext);
+        auto wal = WAL::Get(clientContext);
+        if (walRotated) {
+            wal->logAndFlushCheckpointToFrozen(&clientContext);
+        } else {
+            wal->logAndFlushCheckpoint(&clientContext);
+        }
+        throw RuntimeException("checkpoint failed.");
+    }
+
+private:
+    std::shared_ptr<BlockingCheckpointState> state;
+};
+
 class FlakyCheckpointerTest : public PrivateApiTest {
 public:
     std::string getInputDir() override { return "empty"; }
@@ -249,6 +280,59 @@ TEST_F(FlakyCheckpointerTest, AutoCheckpointWaitsForActiveCheckpoint) {
     auto manualCheckpointResult = manualCheckpointFuture.get();
     ASSERT_TRUE(manualCheckpointResult->isSuccess())
         << manualCheckpointResult->getErrorMessage();
+}
+
+TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);")
+                    ->isSuccess());
+    for (auto i = 0; i < 5000; i++) {
+        auto result = conn->query(stringFormat("CREATE (a:test {id: {}, name: 'name_{}'});", i, i));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+
+    auto state = std::make_shared<BlockingCheckpointState>();
+    auto initBlockingCheckpointer = [state](main::ClientContext& context) {
+        return std::make_unique<BlockingCheckpointerFailsOnApplyingShadow>(context, state);
+    };
+    FlakyCheckpointer blockingCheckpointer(initBlockingCheckpointer);
+    blockingCheckpointer.setCheckpointer(*getClientContext(*conn));
+
+    auto checkpointFuture =
+        std::async(std::launch::async, [&]() { return conn->query("CHECKPOINT;"); });
+    BlockingCheckpointReleaseGuard releaseGuard{state};
+    ASSERT_TRUE(state->waitUntilEntered(std::chrono::seconds(5)));
+
+    auto writerConn = std::make_unique<main::Connection>(database.get());
+    auto writeResult = writerConn->query("CREATE (a:test {id: 5000, name: 'concurrent'});");
+    ASSERT_TRUE(writeResult->isSuccess()) << writeResult->getErrorMessage();
+
+    state->release();
+    ASSERT_TRUE(state->waitUntilFinished(std::chrono::seconds(5)));
+    ASSERT_EQ(checkpointFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto checkpointResult = checkpointFuture.get();
+    ASSERT_FALSE(checkpointResult->isSuccess());
+
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getWALFilePath(databasePath)));
+
+    writeResult.reset();
+    checkpointResult.reset();
+    writerConn.reset();
+    conn.reset();
+    database.reset();
+
+    createDBAndConn();
+    auto countResult = conn->query("MATCH (a:test) RETURN COUNT(a);");
+    ASSERT_TRUE(countResult->isSuccess()) << countResult->getErrorMessage();
+    ASSERT_EQ(countResult->getNext()->getValue(0)->getValue<int64_t>(), 5001);
+    auto rowResult = conn->query("MATCH (a:test) WHERE a.id = 5000 RETURN a.name;");
+    ASSERT_TRUE(rowResult->isSuccess()) << rowResult->getErrorMessage();
+    ASSERT_EQ(rowResult->getNext()->getValue(0)->getValue<std::string>(), "concurrent");
 }
 
 class FlakyCheckpointerFailsOnSerialization final : public Checkpointer {

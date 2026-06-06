@@ -31,6 +31,7 @@ class TransactionManager {
     friend class testing::DBTest;
     friend class testing::FlakyBufferManager;
     friend class testing::FlakyCheckpointer;
+    friend class storage::Checkpointer;
 
     using init_checkpointer_func_t =
         std::function<std::unique_ptr<storage::Checkpointer>(main::ClientContext&)>;
