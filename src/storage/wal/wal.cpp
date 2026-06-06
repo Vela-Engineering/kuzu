@@ -1,5 +1,6 @@
 #include "storage/wal/wal.h"
 
+#include "common/exception/runtime.h"
 #include "common/file_system/file_info.h"
 #include "common/file_system/virtual_file_system.h"
 #include "common/serializer/buffered_file.h"
@@ -49,6 +50,11 @@ bool WAL::rotateForCheckpoint(main::ClientContext* /*context*/) {
     std::unique_lock lck{mtx};
     if (inMemory) {
         return false;
+    }
+    if (vfs->fileOrPathExists(checkpointWalPath)) {
+        throw RuntimeException(
+            "Cannot start checkpoint while a checkpoint WAL is pending recovery. Restart the "
+            "database before retrying checkpoint.");
     }
     if (!serializer && !vfs->fileOrPathExists(walPath)) {
         return false;

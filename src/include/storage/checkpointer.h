@@ -3,6 +3,7 @@
 #include <unordered_map>
 
 #include "common/types/types.h"
+#include "common/uniq_lock.h"
 #include "storage/database_header.h"
 #include "storage/page_range.h"
 
@@ -68,6 +69,7 @@ private:
     PageRange serializeMetadata(const catalog::Catalog& catalog, StorageManager& storageManager);
     PageRange serializeMetadataSnapshot(const catalog::Catalog& catalog,
         StorageManager& storageManager);
+    bool snapshotTableEpochsStillValid() const;
 
 protected:
     main::ClientContext& clientContext;
@@ -87,6 +89,8 @@ protected:
     // Per-table changeEpoch watermarks captured under the write gate.
     // Used to avoid clearing post-snapshot dirty signals from concurrent writers.
     std::unordered_map<common::table_id_t, uint64_t> tableEpochWatermarks;
+    common::UniqLock storageCheckpointWriteGate;
+    bool snapshotInvalidatedByConcurrentWrite = false;
 };
 
 } // namespace storage

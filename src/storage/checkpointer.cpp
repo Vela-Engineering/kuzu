@@ -1,6 +1,7 @@
 #include "storage/checkpointer.h"
 
 #include "catalog/catalog.h"
+#include "common/exception/runtime.h"
 #include "common/file_system/file_system.h"
 #include "common/file_system/virtual_file_system.h"
 #include "common/serializer/buffered_file.h"
@@ -15,6 +16,7 @@
 #include "storage/storage_manager.h"
 #include "storage/wal/local_wal.h"
 #include "transaction/transaction.h"
+#include "transaction/transaction_manager.h"
 
 namespace kuzu {
 namespace storage {
@@ -121,6 +123,8 @@ void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
     }
 
     snapshotTS = snapshotTimestamp;
+    snapshotInvalidatedByConcurrentWrite = false;
+    storageCheckpointWriteGate = {};
 
     auto storageManager = StorageManager::Get(clientContext);
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
@@ -146,6 +150,11 @@ void Checkpointer::finishCheckpoint() {
     if (isInMemory) {
         return;
     }
+    if (snapshotInvalidatedByConcurrentWrite) {
+        throw common::RuntimeException(
+            "Checkpoint snapshot was invalidated by a concurrent write. Restart the database "
+            "before retrying checkpoint.");
+    }
     serializeCatalogAndMetadata(checkpointHeader, hasStorageChanges);
     writeDatabaseHeader(checkpointHeader);
     logCheckpointAndApplyShadowPages(walRotated);
@@ -170,12 +179,34 @@ void Checkpointer::postCheckpointCleanup() {
         storageManager->getWAL().reset();
     }
     storageManager->getShadowFile().reset();
+    storageCheckpointWriteGate = {};
+}
+
+bool Checkpointer::snapshotTableEpochsStillValid() const {
+    const auto storageManager = StorageManager::Get(clientContext);
+    const auto currentEpochs = storageManager->captureChangeEpochs();
+    for (const auto& [tableID, checkpointEpoch] : tableEpochWatermarks) {
+        const auto currentEpoch = currentEpochs.find(tableID);
+        if (currentEpoch == currentEpochs.end() || currentEpoch->second != checkpointEpoch) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool Checkpointer::checkpointStorage() {
     const auto storageManager = StorageManager::Get(clientContext);
     auto pageAllocator = storageManager->getDataFH()->getPageManager();
     if (snapshotTS > 0) {
+        if (walRotated) {
+            auto transactionManager = transaction::TransactionManager::Get(clientContext);
+            storageCheckpointWriteGate =
+                transactionManager->stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
+            if (!snapshotTableEpochsStillValid()) {
+                snapshotInvalidatedByConcurrentWrite = true;
+                return false;
+            }
+        }
         const transaction::Transaction snapshotTxn(transaction::TransactionType::CHECKPOINT,
             transaction::Transaction::DUMMY_TRANSACTION_ID, snapshotTS);
         return storageManager->checkpoint(&clientContext, snapshotTxn, *pageAllocator,
@@ -253,6 +284,7 @@ void Checkpointer::rollback() {
     auto catalog = catalog::Catalog::Get(clientContext);
     // Any pages freed during the checkpoint are no longer freed
     storageManager->rollbackCheckpoint(*catalog);
+    storageCheckpointWriteGate = {};
 }
 
 bool Checkpointer::canAutoCheckpoint(const main::ClientContext& clientContext,
