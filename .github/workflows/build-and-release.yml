@@ -35,9 +35,9 @@ jobs:
           path: ./scripts/pip-package
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22
+        uses: pypa/cibuildwheel@v3.4.1
         env:
-          CIBW_BUILD: "cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+          CIBW_BUILD: "cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64 cp314-manylinux_x86_64"
           CIBW_SKIP: "pp* *musllinux*"
           CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
           CIBW_ARCHS_LINUX: "x86_64"
@@ -63,9 +63,9 @@ jobs:
           path: ./scripts/pip-package
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22
+        uses: pypa/cibuildwheel@v3.4.1
         env:
-          CIBW_BUILD: "cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+          CIBW_BUILD: "cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64 cp314-manylinux_aarch64"
           CIBW_SKIP: "pp* *musllinux*"
           CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
           CIBW_ARCHS_LINUX: "aarch64"
@@ -102,9 +102,9 @@ jobs:
           done
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.22
+        uses: pypa/cibuildwheel@v3.4.1
         env:
-          CIBW_BUILD: "cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64"
+          CIBW_BUILD: "cp311-macosx_arm64 cp312-macosx_arm64 cp313-macosx_arm64 cp314-macosx_arm64"
           CIBW_SKIP: "pp*"
           CIBW_ENVIRONMENT: "NUM_THREADS=3 MACOSX_DEPLOYMENT_TARGET=11.0"
           CIBW_BUILD_VERBOSITY: 1

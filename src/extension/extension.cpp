@@ -50,13 +50,28 @@ std::string getPlatform() {
     return getOS() + "_" + getArch();
 }
 
+std::string ExtensionUtils::getDefaultExtensionRepo() {
+    auto repo = main::ClientContext::getEnvVariable(EXTENSION_REPO_ENV_VAR);
+    return repo.empty() ? OFFICIAL_EXTENSION_REPO : repo;
+}
+
 static ExtensionRepoInfo getExtensionRepoInfo(std::string& extensionURL) {
-    common::StringUtils::replaceAll(extensionURL, "http://", "");
-    auto hostNamePos = extensionURL.find('/');
-    auto hostName = extensionURL.substr(0, hostNamePos);
-    auto hostURL = "http://" + hostName;
-    auto hostPath = extensionURL.substr(hostNamePos);
+    const auto schemeEnd = extensionURL.find("://");
+    const auto authorityStart = schemeEnd == std::string::npos ? 0 : schemeEnd + 3;
+    const auto pathStart = extensionURL.find("/", authorityStart);
+    auto hostURL = extensionURL.substr(0, pathStart);
+    if (schemeEnd == std::string::npos) {
+        hostURL = "http://" + hostURL;
+    }
+    const auto hostPath = pathStart == std::string::npos ? "/" : extensionURL.substr(pathStart);
     return {hostPath, hostURL, extensionURL};
+}
+
+static std::string normalizeExtensionRepo(std::string extensionRepo) {
+    if (!extensionRepo.empty() && extensionRepo.back() != '/') {
+        extensionRepo += "/";
+    }
+    return extensionRepo;
 }
 
 std::string ExtensionSourceUtils::toString(ExtensionSource source) {
@@ -74,8 +89,9 @@ std::string ExtensionSourceUtils::toString(ExtensionSource source) {
 
 static ExtensionRepoInfo getExtensionFilePath(const std::string& extensionName,
     const std::string& extensionRepo, const std::string& fileName) {
+    auto normalizedRepo = normalizeExtensionRepo(extensionRepo);
     auto extensionURL = common::stringFormat(ExtensionUtils::EXTENSION_FILE_REPO_PATH,
-        extensionRepo, KUZU_EXTENSION_VERSION, getPlatform(), extensionName, fileName);
+        normalizedRepo, KUZU_EXTENSION_VERSION, getPlatform(), extensionName, fileName);
     return getExtensionRepoInfo(extensionURL);
 }
 
@@ -98,8 +114,9 @@ ExtensionRepoInfo ExtensionUtils::getExtensionInstallerRepoInfo(const std::strin
 
 ExtensionRepoInfo ExtensionUtils::getSharedLibRepoInfo(const std::string& fileName,
     const std::string& extensionRepo) {
-    auto extensionURL = common::stringFormat(SHARED_LIB_REPO, extensionRepo, KUZU_EXTENSION_VERSION,
-        getPlatform(), fileName);
+    auto normalizedRepo = normalizeExtensionRepo(extensionRepo);
+    auto extensionURL = common::stringFormat(SHARED_LIB_REPO, normalizedRepo,
+        KUZU_EXTENSION_VERSION, getPlatform(), fileName);
     return getExtensionRepoInfo(extensionURL);
 }
 
