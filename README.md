@@ -94,7 +94,14 @@ No server. No Docker. Just `pip install` and query.
 
 KuzuDB v0.11.3+ bundles four commonly used extensions (`algo`, `fts`, `json`, `vector`). No manual installation needed.
 
-The Vela-maintained fork publishes FTS extension artifacts to a static GitHub Pages registry:
+The Vela-maintained fork publishes FTS extension artifacts to a static GitHub Pages registry. FTS installs use this registry by default:
+
+```sql
+INSTALL fts;
+LOAD fts;
+```
+
+You can also set the registry explicitly:
 
 ```bash
 export KUZU_EXTENSION_REPO=https://vela-engineering.github.io/kuzu/

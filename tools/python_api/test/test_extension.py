@@ -27,7 +27,7 @@ def extension_extension_dir_prefix() -> str:
     return extension_extension_dir_prefix
 
 
-def test_extension_install_httpfs(conn_db_readwrite: ConnDB, tmpdir: str, extension_extension_dir_prefix: str) -> None:
+def test_extension_install_fts(conn_db_readwrite: ConnDB, tmpdir: str, extension_extension_dir_prefix: str) -> None:
     current_dir = Path(__file__).resolve().parent
     cmake_list_file = Path(current_dir).parent.parent.parent / "CMakeLists.txt"
     extension_version = None
@@ -44,20 +44,20 @@ def test_extension_install_httpfs(conn_db_readwrite: ConnDB, tmpdir: str, extens
             "extension",
             extension_version,
             extension_extension_dir_prefix,
-            "httpfs",
-            "libhttpfs.kuzu_extension",
+            "fts",
+            "libfts.kuzu_extension",
         )
         .resolve()
     )
     opener = urllib.request.build_opener()
     opener.addheaders = [("User-agent", "Kuzu Test Suite")]
     urllib.request.install_opener(opener)
-    download_url = f"http://extension.kuzudb.com/v{extension_version}/{extension_extension_dir_prefix}/httpfs/libhttpfs.kuzu_extension"
-    temp_path = Path(tmpdir) / "libhttpfs.kuzu_extension"
+    download_url = f"https://vela-engineering.github.io/kuzu/v{extension_version}/{extension_extension_dir_prefix}/fts/libfts.kuzu_extension"
+    temp_path = Path(tmpdir) / "libfts.kuzu_extension"
     urllib.request.urlretrieve(download_url, temp_path)
 
     conn, _ = conn_db_readwrite
-    conn.execute("INSTALL hTtpFs")
+    conn.execute("INSTALL fts")
 
     assert Path.exists(extension_path)
 
