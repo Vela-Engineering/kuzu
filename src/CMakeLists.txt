@@ -18,12 +18,33 @@ add_subdirectory(planner)
 add_subdirectory(processor)
 add_subdirectory(storage)
 add_subdirectory(transaction)
+
+option(KUZU_ENABLE_HTTPS_EXTENSION_DOWNLOADS "Enable HTTPS extension downloads." TRUE)
+option(KUZU_USE_STATIC_OPENSSL "Use static OpenSSL libraries for HTTPS extension downloads unless AddressSanitizer is enabled." TRUE)
+if (__WASM__ OR __ANDROID__)
+        set(KUZU_ENABLE_HTTPS_EXTENSION_DOWNLOADS FALSE)
+endif()
+
+if (KUZU_ENABLE_HTTPS_EXTENSION_DOWNLOADS)
+        if (${ENABLE_ADDRESS_SANITIZER})
+                set(OPENSSL_USE_STATIC_LIBS FALSE)
+        else ()
+                set(OPENSSL_USE_STATIC_LIBS ${KUZU_USE_STATIC_OPENSSL})
+        endif()
+        find_package(OpenSSL REQUIRED)
+endif()
+
 add_subdirectory(extension)
 
 add_library(kuzu STATIC ${ALL_OBJECT_FILES})
 add_library(kuzu_shared SHARED ${ALL_OBJECT_FILES})
 
-set(KUZU_LIBRARIES antlr4_cypher antlr4_runtime brotlidec brotlicommon fast_float utf8proc re2 fastpfor parquet snappy thrift yyjson zstd miniz mbedtls lz4 roaring_bitmap simsimd)
+set(KUZU_LIBRARIES
+        antlr4_cypher antlr4_runtime brotlidec brotlicommon fast_float utf8proc re2 fastpfor
+        parquet snappy thrift yyjson zstd miniz mbedtls lz4 roaring_bitmap simsimd)
+if (KUZU_ENABLE_HTTPS_EXTENSION_DOWNLOADS)
+        set(KUZU_LIBRARIES ${KUZU_LIBRARIES} ${OPENSSL_LIBRARIES})
+endif()
 if (NOT __SINGLE_THREADED__)
         set(KUZU_LIBRARIES ${KUZU_LIBRARIES} Threads::Threads)
 endif()

@@ -46,14 +46,6 @@ include_directories(
 
 add_library(kuzu_generated_extension_loader OBJECT ${GENERATED_CPP_FILE})
 
-# Both the kuzu source and httpfs extension includes the httplib which is a header
-# only library. Httpfs requires the openssl function to be enabled in httplib, so
-# we also have to enable httplib there if httpfs is static linked.
-if ("httpfs" IN_LIST STATICALLY_LINKED_EXTENSIONS)
-    add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
-    include_directories(${OPENSSL_INCLUDE_DIR})
-endif ()
-
 add_library(kuzu_extension
         OBJECT
         catalog_extension.cpp
@@ -63,6 +55,10 @@ add_library(kuzu_extension
         extension_manager.cpp
         loaded_extension.cpp
 )
+if (KUZU_ENABLE_HTTPS_EXTENSION_DOWNLOADS OR "httpfs" IN_LIST STATICALLY_LINKED_EXTENSIONS)
+        target_compile_definitions(kuzu_extension PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+        target_include_directories(kuzu_extension PRIVATE ${OPENSSL_INCLUDE_DIR})
+endif ()
 
 set(ALL_OBJECT_FILES
         ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:kuzu_extension>
