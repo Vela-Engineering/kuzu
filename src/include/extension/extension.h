@@ -59,6 +59,7 @@ void addFunc(main::Database& database, std::string name, catalog::CatalogEntryTy
 
 struct KUZU_API ExtensionUtils {
     static constexpr const char* OFFICIAL_EXTENSION_REPO = "http://extension.kuzudb.com/";
+    static constexpr const char* EXTENSION_REPO_ENV_VAR = "KUZU_EXTENSION_REPO";
     static constexpr const char* EXTENSION_FILE_SUFFIX = "kuzu_extension";
 
     static constexpr const char* EXTENSION_FILE_REPO_PATH = "{}v{}/{}/{}/{}";
@@ -74,6 +75,8 @@ struct KUZU_API ExtensionUtils {
     static constexpr const char* EXTENSION_LOADER_SUFFIX = "_loader";
 
     static constexpr const char* EXTENSION_INSTALLER_SUFFIX = "_installer";
+
+    static std::string getDefaultExtensionRepo();
 
     static ExtensionRepoInfo getExtensionLibRepoInfo(const std::string& extensionName,
         const std::string& extensionRepo);
