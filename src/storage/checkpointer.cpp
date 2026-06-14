@@ -104,15 +104,13 @@ void Checkpointer::writeCheckpoint() {
     auto storageManager = StorageManager::Get(clientContext);
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
-    auto databaseHeader =
-        *storageManager->getOrInitDatabaseHeader(clientContext);
+    auto databaseHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
     bool hasStorageChanges = checkpointStorage();
     serializeCatalogAndMetadata(databaseHeader, hasStorageChanges);
     writeDatabaseHeader(databaseHeader);
     logCheckpointAndApplyShadowPages(walRotated);
 
-    // Snapshot versions while the write gate is still held, before postCheckpointCleanup
-    // runs with the gate released. This prevents capturing version bumps from new writers.
+    // Snapshot versions before postCheckpointCleanup resets change tracking.
     catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
     pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
 }
@@ -123,17 +121,13 @@ void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
     }
 
     snapshotTS = snapshotTimestamp;
-    snapshotInvalidatedByConcurrentWrite = false;
-    storageCheckpointWriteGate = {};
 
     auto storageManager = StorageManager::Get(clientContext);
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
     checkpointHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
 
-    // Capture versions while the write gate is still held, before checkpointStoragePhase
-    // runs with the gate released. This prevents losing version bumps from new writers
-    // that start after the gate is released.
+    // Capture versions before any transaction can start after WAL rotation.
     catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
     pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
     tableEpochWatermarks = storageManager->captureChangeEpochs();
@@ -149,11 +143,6 @@ void Checkpointer::checkpointStoragePhase() {
 void Checkpointer::finishCheckpoint() {
     if (isInMemory) {
         return;
-    }
-    if (snapshotInvalidatedByConcurrentWrite) {
-        throw common::RuntimeException(
-            "Checkpoint snapshot was invalidated by a concurrent write. Restart the database "
-            "before retrying checkpoint.");
     }
     serializeCatalogAndMetadata(checkpointHeader, hasStorageChanges);
     writeDatabaseHeader(checkpointHeader);
@@ -179,34 +168,12 @@ void Checkpointer::postCheckpointCleanup() {
         storageManager->getWAL().reset();
     }
     storageManager->getShadowFile().reset();
-    storageCheckpointWriteGate = {};
-}
-
-bool Checkpointer::snapshotTableEpochsStillValid() const {
-    const auto storageManager = StorageManager::Get(clientContext);
-    const auto currentEpochs = storageManager->captureChangeEpochs();
-    for (const auto& [tableID, checkpointEpoch] : tableEpochWatermarks) {
-        const auto currentEpoch = currentEpochs.find(tableID);
-        if (currentEpoch == currentEpochs.end() || currentEpoch->second != checkpointEpoch) {
-            return false;
-        }
-    }
-    return true;
 }
 
 bool Checkpointer::checkpointStorage() {
     const auto storageManager = StorageManager::Get(clientContext);
     auto pageAllocator = storageManager->getDataFH()->getPageManager();
     if (snapshotTS > 0) {
-        if (walRotated) {
-            auto transactionManager = transaction::TransactionManager::Get(clientContext);
-            storageCheckpointWriteGate =
-                transactionManager->stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
-            if (!snapshotTableEpochsStillValid()) {
-                snapshotInvalidatedByConcurrentWrite = true;
-                return false;
-            }
-        }
         const transaction::Transaction snapshotTxn(transaction::TransactionType::CHECKPOINT,
             transaction::Transaction::DUMMY_TRANSACTION_ID, snapshotTS);
         return storageManager->checkpoint(&clientContext, snapshotTxn, *pageAllocator,
@@ -225,16 +192,16 @@ void Checkpointer::serializeCatalogAndMetadata(DatabaseHeader& databaseHeader,
     if (databaseHeader.catalogPageRange.startPageIdx == common::INVALID_PAGE_IDX ||
         catalog->changedSinceLastCheckpoint()) {
         databaseHeader.updateCatalogPageRange(*dataFH->getPageManager(),
-            useSnapshot ? serializeCatalogSnapshot(*catalog, *storageManager)
-                        : serializeCatalog(*catalog, *storageManager));
+            useSnapshot ? serializeCatalogSnapshot(*catalog, *storageManager) :
+                          serializeCatalog(*catalog, *storageManager));
     }
     if (databaseHeader.metadataPageRange.startPageIdx == common::INVALID_PAGE_IDX ||
         storageChanges || catalog->changedSinceLastCheckpoint() ||
         dataFH->getPageManager()->changedSinceLastCheckpoint()) {
         databaseHeader.freeMetadataPageRange(*dataFH->getPageManager());
         databaseHeader.metadataPageRange =
-            useSnapshot ? serializeMetadataSnapshot(*catalog, *storageManager)
-                        : serializeMetadata(*catalog, *storageManager);
+            useSnapshot ? serializeMetadataSnapshot(*catalog, *storageManager) :
+                          serializeMetadata(*catalog, *storageManager);
     }
 }
 
@@ -284,7 +251,6 @@ void Checkpointer::rollback() {
     auto catalog = catalog::Catalog::Get(clientContext);
     // Any pages freed during the checkpoint are no longer freed
     storageManager->rollbackCheckpoint(*catalog);
-    storageCheckpointWriteGate = {};
 }
 
 bool Checkpointer::canAutoCheckpoint(const main::ClientContext& clientContext,

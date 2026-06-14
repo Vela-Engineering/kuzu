@@ -2,6 +2,7 @@
 
 #include "catalog/catalog_entry/node_table_catalog_entry.h"
 #include "common/cast.h"
+#include "common/data_chunk/data_chunk_state.h"
 #include "common/exception/message.h"
 #include "common/exception/runtime.h"
 #include "common/types/types.h"
@@ -20,6 +21,52 @@ using namespace kuzu::evaluator;
 
 namespace kuzu {
 namespace storage {
+
+static std::pair<ChunkedNodeGroup*, row_idx_t> getChunkedGroupAndRow(const NodeGroup& nodeGroup,
+    row_idx_t rowIdx) {
+    for (auto chunkedGroupIdx = 0u; chunkedGroupIdx < nodeGroup.getNumChunkedGroups();
+        chunkedGroupIdx++) {
+        auto* chunkedGroup = nodeGroup.getChunkedNodeGroup(chunkedGroupIdx);
+        if (rowIdx < chunkedGroup->getNumRows()) {
+            return {chunkedGroup, rowIdx};
+        }
+        rowIdx -= chunkedGroup->getNumRows();
+    }
+    KU_UNREACHABLE;
+}
+
+static void logLocalNodeInsertionsToWAL(LocalWAL& wal, table_id_t tableID,
+    LocalNodeTable& localNodeTable, MemoryManager& mm) {
+    for (auto localNodeGroupIdx = 0u; localNodeGroupIdx < localNodeTable.getNumNodeGroups();
+        localNodeGroupIdx++) {
+        const auto localNodeGroup = localNodeTable.getNodeGroup(localNodeGroupIdx);
+        for (auto chunkedGroupIdx = 0u; chunkedGroupIdx < localNodeGroup->getNumChunkedGroups();
+            chunkedGroupIdx++) {
+            const auto* chunkedGroup = localNodeGroup->getChunkedNodeGroup(chunkedGroupIdx);
+            for (auto startRow = 0u; startRow < chunkedGroup->getNumRows();
+                startRow += DEFAULT_VECTOR_CAPACITY) {
+                const auto numRows = std::min<row_idx_t>(DEFAULT_VECTOR_CAPACITY,
+                    chunkedGroup->getNumRows() - startRow);
+                auto state = std::make_shared<DataChunkState>();
+                state->getSelVectorUnsafe().setToUnfiltered(numRows);
+                std::vector<std::unique_ptr<ValueVector>> ownedVectors;
+                std::vector<ValueVector*> vectors;
+                ownedVectors.reserve(chunkedGroup->getNumColumns());
+                vectors.reserve(chunkedGroup->getNumColumns());
+                for (auto columnID = 0u; columnID < chunkedGroup->getNumColumns(); columnID++) {
+                    const auto& columnChunk = chunkedGroup->getColumnChunk(columnID);
+                    auto vector =
+                        std::make_unique<ValueVector>(columnChunk.getDataType().copy(), &mm, state);
+                    ChunkState chunkState;
+                    columnChunk.scan(&DUMMY_TRANSACTION, chunkState, *vector, startRow, numRows);
+                    vectors.push_back(vector.get());
+                    ownedVectors.push_back(std::move(vector));
+                }
+                wal.logTableInsertion(tableID, TableType::NODE, numRows, vectors);
+            }
+        }
+    }
+}
 
 NodeTableVersionRecordHandler::NodeTableVersionRecordHandler(NodeTable* table) : table(table) {}
 
@@ -436,13 +483,6 @@ void NodeTable::insert(Transaction* transaction, TableInsertState& insertState) 
         index->insert(transaction, nodeInsertState.nodeIDVector, indexedPropertyVectors,
             *nodeInsertState.indexInsertStates[i]);
     }
-    if (insertState.logToWAL && transaction->shouldLogToWAL()) {
-        KU_ASSERT(transaction->isWriteTransaction());
-        auto& wal = transaction->getLocalWAL();
-        wal.logTableInsertion(tableID, TableType::NODE,
-            nodeInsertState.nodeIDVector.state->getSelVector().getSelSize(),
-            insertState.propertyVectors);
-    }
     setHasChanges();
 }
 
@@ -486,7 +526,8 @@ void NodeTable::update(Transaction* transaction, TableUpdateState& updateState) 
         index->update(transaction, nodeUpdateState.nodeIDVector, nodeUpdateState.propertyVector,
             *nodeUpdateState.indexUpdateState[i]);
     }
-    if (transaction->isUnCommitted(tableID, nodeOffset)) {
+    const auto isLocalNode = transaction->isUnCommitted(tableID, nodeOffset);
+    if (isLocalNode) {
         const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
         KU_ASSERT(localTable);
         localTable->update(&DUMMY_TRANSACTION, updateState);
@@ -498,7 +539,7 @@ void NodeTable::update(Transaction* transaction, TableUpdateState& updateState) 
             ->update(transaction, rowIdxInGroup, nodeUpdateState.columnID,
                 nodeUpdateState.propertyVector);
     }
-    if (updateState.logToWAL && transaction->shouldLogToWAL()) {
+    if (!isLocalNode && updateState.logToWAL && transaction->shouldLogToWAL()) {
         KU_ASSERT(transaction->isWriteTransaction());
         auto& wal = transaction->getLocalWAL();
         wal.logNodeUpdate(tableID, nodeUpdateState.columnID, nodeOffset,
@@ -516,13 +557,14 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
     }
     bool isDeleted = false;
     const auto nodeOffset = nodeDeleteState.nodeIDVector.readNodeOffset(pos);
+    const auto isLocalNode = transaction->isUnCommitted(tableID, nodeOffset);
     for (auto& index : indexes) {
         auto indexDeleteState = index.getIndex()->initDeleteState(transaction, memoryManager,
             getVisibleFunc(transaction));
         index.getIndex()->delete_(transaction, nodeDeleteState.nodeIDVector, *indexDeleteState);
     }
 
-    if (transaction->isUnCommitted(tableID, nodeOffset)) {
+    if (isLocalNode) {
         const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
         isDeleted = localTable->delete_(&DUMMY_TRANSACTION, deleteState);
     } else {
@@ -536,7 +578,7 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
     }
     if (isDeleted) {
         setHasChanges();
-        if (deleteState.logToWAL && transaction->shouldLogToWAL()) {
+        if (!isLocalNode && deleteState.logToWAL && transaction->shouldLogToWAL()) {
             KU_ASSERT(transaction->isWriteTransaction());
             auto& wal = transaction->getLocalWAL();
             wal.logNodeDeletion(tableID, nodeOffset, &nodeDeleteState.pkVector);
@@ -595,10 +637,14 @@ void NodeTable::commit(main::ClientContext* context, TableCatalogEntry* tableEnt
     // connected local rels. Directly removing them will cause shift of committed node offset,
     // leading to an inconsistent result with connected rels.
     nodeGroups->append(transaction, columnIDsToCommit, localNodeTable.getNodeGroups());
+    if (transaction->shouldLogToWAL()) {
+        logLocalNodeInsertionsToWAL(transaction->getLocalWAL(), tableID, localNodeTable,
+            *memoryManager);
+    }
     // 2. Set deleted flag for tuples that are deleted in local storage.
     row_idx_t numLocalRows = 0u;
     for (auto localNodeGroupIdx = 0u; localNodeGroupIdx < localNodeTable.getNumNodeGroups();
-         localNodeGroupIdx++) {
+        localNodeGroupIdx++) {
         const auto localNodeGroup = localNodeTable.getNodeGroup(localNodeGroupIdx);
         if (localNodeGroup->hasDeletions(transaction)) {
             // TODO(Guodong): Assume local storage is small here. Should optimize the loop away by
@@ -606,6 +652,18 @@ void NodeTable::commit(main::ClientContext* context, TableCatalogEntry* tableEnt
             for (auto row = 0u; row < localNodeGroup->getNumRows(); row++) {
                 if (localNodeGroup->isDeleted(transaction, row)) {
                     const auto nodeOffset = startNodeOffset + numLocalRows + row;
+                    if (transaction->shouldLogToWAL()) {
+                        const auto [chunkedGroup, rowIdxInGroup] =
+                            getChunkedGroupAndRow(*localNodeGroup, row);
+                        auto state = DataChunkState::getSingleValueDataChunkState();
+                        ValueVector pkVector(
+                            chunkedGroup->getColumnChunk(pkColumnID).getDataType().copy(),
+                            memoryManager, state);
+                        ChunkState chunkState;
+                        chunkedGroup->getColumnChunk(pkColumnID)
+                            .lookup(&DUMMY_TRANSACTION, chunkState, rowIdxInGroup, pkVector, 0);
+                        transaction->getLocalWAL().logNodeDeletion(tableID, nodeOffset, &pkVector);
+                    }
                     const auto nodeGroupIdx = StorageUtils::getNodeGroupIdx(nodeOffset);
                     const auto rowIdxInGroup =
                         nodeOffset - StorageUtils::getStartOffsetOfNodeGroup(nodeGroupIdx);
@@ -651,8 +709,8 @@ visible_func NodeTable::getVisibleFunc(const Transaction* transaction) const {
 bool NodeTable::checkpoint(main::ClientContext* context, TableCatalogEntry* tableEntry,
     PageAllocator& pageAllocator, const Transaction* snapshotTxn, uint64_t epochWatermark) {
     // Use the gate-time watermark if provided; otherwise fall back to live read.
-    const auto effectiveEpoch = epochWatermark > 0 ? epochWatermark :
-        changeEpoch.load(std::memory_order_acquire);
+    const auto effectiveEpoch =
+        epochWatermark > 0 ? epochWatermark : changeEpoch.load(std::memory_order_acquire);
     if (effectiveEpoch <= lastCheckpointedEpoch) {
         return false;
     }
@@ -756,7 +814,7 @@ void NodeTable::scanIndexColumns(main::ClientContext* context, IndexScanHelper& 
 
     const auto numNodeGroups = nodeGroups_.getNumNodeGroups();
     for (node_group_idx_t nodeGroupToScan = 0u; nodeGroupToScan < numNodeGroups;
-         ++nodeGroupToScan) {
+        ++nodeGroupToScan) {
         scanState->nodeGroup = nodeGroups_.getNodeGroupNoLock(nodeGroupToScan);
 
         // It is possible for the node group to have no chunked groups if we are rolling back due to

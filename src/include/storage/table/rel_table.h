@@ -182,8 +182,7 @@ public:
     }
     common::column_id_t getNumColumns() const {
         KU_ASSERT(directedRelData.size() >= 1);
-        RUNTIME_CHECK(for (const auto& relData
-                           : directedRelData) {
+        RUNTIME_CHECK(for (const auto& relData : directedRelData) {
             KU_ASSERT(relData->getNumColumns() == directedRelData[0]->getNumColumns());
         });
         return directedRelData[0]->getNumColumns();
@@ -198,8 +197,7 @@ public:
     void commit(main::ClientContext* context, catalog::TableCatalogEntry* tableEntry,
         LocalTable* localTable) override;
     bool checkpoint(main::ClientContext*, catalog::TableCatalogEntry* tableEntry,
-        PageAllocator& pageAllocator,
-        const transaction::Transaction* snapshotTxn = nullptr,
+        PageAllocator& pageAllocator, const transaction::Transaction* snapshotTxn = nullptr,
         uint64_t epochWatermark = 0) override;
     void rollbackCheckpoint() override {};
     void reclaimStorage(PageAllocator& pageAllocator) const override;
@@ -232,10 +230,7 @@ private:
         CSRNodeGroup& csrNodeGroup, common::offset_t boundOffsetInGroup,
         const row_idx_vec_t& rowIndices, common::column_id_t skippedColumn);
 
-    void updateRelOffsets(const LocalRelTable& localRelTable);
-
-    static common::offset_t getCommittedOffset(common::offset_t uncommittedOffset,
-        common::offset_t maxCommittedOffset);
+    void updateRelOffsets(const LocalRelTable& localRelTable, const row_idx_vec_t& activeRows);
 
     void detachDeleteForCSRRels(transaction::Transaction* transaction, RelTableData* tableData,
         RelTableData* reverseTableData, RelTableScanState* relDataReadState,

@@ -267,19 +267,57 @@ TEST_F(FlakyCheckpointerTest, AutoCheckpointWaitsForActiveCheckpoint) {
     ASSERT_TRUE(state->waitUntilEnteredCount(1, std::chrono::seconds(5)));
 
     auto writerConn = std::make_unique<main::Connection>(database.get());
-    auto writeResult = writerConn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);");
+    auto writerFuture = std::async(std::launch::async,
+        [&]() { return writerConn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);"); });
+    ASSERT_EQ(writerFuture.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    state->releaseNext();
+    ASSERT_EQ(manualCheckpointFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto manualCheckpointResult = manualCheckpointFuture.get();
+    ASSERT_TRUE(manualCheckpointResult->isSuccess()) << manualCheckpointResult->getErrorMessage();
+    ASSERT_EQ(writerFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto writeResult = writerFuture.get();
     ASSERT_TRUE(writeResult->isSuccess()) << writeResult->getErrorMessage();
 
-    state->releaseNext();
     ASSERT_TRUE(state->waitUntilEnteredCount(2, std::chrono::seconds(5)));
     state->releaseNext();
     ASSERT_TRUE(state->waitUntilFinishedCount(2, std::chrono::seconds(5)));
+}
 
-    ASSERT_EQ(manualCheckpointFuture.wait_for(std::chrono::seconds(5)),
-        std::future_status::ready);
-    auto manualCheckpointResult = manualCheckpointFuture.get();
-    ASSERT_TRUE(manualCheckpointResult->isSuccess())
-        << manualCheckpointResult->getErrorMessage();
+TEST_F(FlakyCheckpointerTest, CheckpointWaitsForActiveReadTransaction) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 1});")->isSuccess());
+
+    auto state = std::make_shared<BlockingCheckpointState>();
+    auto initBlockingCheckpointer = [state](main::ClientContext& context) {
+        return std::make_unique<BlockingCheckpointer>(context, state);
+    };
+    FlakyCheckpointer blockingCheckpointer(initBlockingCheckpointer);
+    blockingCheckpointer.setCheckpointer(*getClientContext(*conn));
+
+    auto readConn = std::make_unique<main::Connection>(database.get());
+    auto checkpointConn = std::make_unique<main::Connection>(database.get());
+    ASSERT_TRUE(readConn->query("BEGIN TRANSACTION READ ONLY;")->isSuccess());
+    auto readResult = readConn->query("MATCH (n:test) RETURN COUNT(n);");
+    ASSERT_TRUE(readResult->isSuccess()) << readResult->getErrorMessage();
+
+    auto checkpointFuture =
+        std::async(std::launch::async, [&]() { return checkpointConn->query("CHECKPOINT;"); });
+    BlockingCheckpointReleaseGuard releaseGuard{state};
+    ASSERT_EQ(checkpointFuture.wait_for(std::chrono::milliseconds(100)),
+        std::future_status::timeout);
+    ASSERT_FALSE(state->waitUntilEnteredCount(1, std::chrono::seconds(0)));
+
+    ASSERT_TRUE(readConn->query("COMMIT;")->isSuccess());
+    ASSERT_TRUE(state->waitUntilEntered(std::chrono::seconds(5)));
+    state->releaseNext();
+    ASSERT_EQ(checkpointFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto checkpointResult = checkpointFuture.get();
+    ASSERT_TRUE(checkpointResult->isSuccess()) << checkpointResult->getErrorMessage();
 }
 
 TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
@@ -288,8 +326,8 @@ TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
     }
     ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
     ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
-    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);")
-                    ->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);")->isSuccess());
     for (auto i = 0; i < 5000; i++) {
         auto result = conn->query(stringFormat("CREATE (a:test {id: {}, name: 'name_{}'});", i, i));
         ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
@@ -308,14 +346,17 @@ TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
     ASSERT_TRUE(state->waitUntilEntered(std::chrono::seconds(5)));
 
     auto writerConn = std::make_unique<main::Connection>(database.get());
-    auto writeResult = writerConn->query("CREATE (a:test {id: 5000, name: 'concurrent'});");
-    ASSERT_TRUE(writeResult->isSuccess()) << writeResult->getErrorMessage();
-
+    auto writerFuture = std::async(std::launch::async,
+        [&]() { return writerConn->query("CREATE (a:test {id: 5000, name: 'concurrent'});"); });
+    ASSERT_EQ(writerFuture.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
     state->release();
     ASSERT_TRUE(state->waitUntilFinished(std::chrono::seconds(5)));
     ASSERT_EQ(checkpointFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto checkpointResult = checkpointFuture.get();
     ASSERT_FALSE(checkpointResult->isSuccess());
+    ASSERT_EQ(writerFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto writeResult = writerFuture.get();
+    ASSERT_TRUE(writeResult->isSuccess()) << writeResult->getErrorMessage();
 
     const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
     ASSERT_TRUE(std::filesystem::exists(frozenWalPath));

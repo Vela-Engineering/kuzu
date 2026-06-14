@@ -9,7 +9,24 @@ from pathlib import Path
 import pytest
 from type_aliases import ConnDB
 
-EXTENSION_CMAKE_PREFIX = 'add_definitions(-DKUZU_EXTENSION_VERSION="'
+CMAKE_PROJECT_PREFIX = "project(Kuzu VERSION "
+CMAKE_EXTENSION_VERSION_PREFIX = 'set(KUZU_EXTENSION_VERSION "'
+
+
+def extract_extension_version(cmake_list_file: Path) -> str:
+    project_version = None
+    extension_version = None
+    with Path.open(cmake_list_file) as f:
+        for line in f:
+            if line.startswith(CMAKE_PROJECT_PREFIX):
+                project_version = line.split(CMAKE_PROJECT_PREFIX)[1].split(" ")[0]
+            if line.startswith(CMAKE_EXTENSION_VERSION_PREFIX):
+                extension_version = line.split(CMAKE_EXTENSION_VERSION_PREFIX)[1].split('"')[0]
+    if project_version and (not extension_version or extension_version == "${CMAKE_PROJECT_VERSION}"):
+        return project_version
+    if extension_version:
+        return extension_version
+    raise RuntimeError("Failed to infer Kuzu extension version from CMakeLists.txt")
 
 
 @pytest.fixture
@@ -30,12 +47,7 @@ def extension_extension_dir_prefix() -> str:
 def test_extension_install_fts(conn_db_readwrite: ConnDB, tmpdir: str, extension_extension_dir_prefix: str) -> None:
     current_dir = Path(__file__).resolve().parent
     cmake_list_file = Path(current_dir).parent.parent.parent / "CMakeLists.txt"
-    extension_version = None
-    with Path.open(cmake_list_file) as f:
-        for line in f:
-            if EXTENSION_CMAKE_PREFIX in line:
-                extension_version = line.split(EXTENSION_CMAKE_PREFIX)[1].split('"')[0]
-                break
+    extension_version = extract_extension_version(cmake_list_file)
     userdir = os.path.expanduser("~")  # noqa: PTH111
     extension_path = (
         Path(userdir)

@@ -96,6 +96,13 @@ struct RecursivePatternFactorSetting {
     static common::Value getSetting(const ClientContext* context);
 };
 
+struct ConcurrentWritesSetting {
+    static constexpr auto name = "concurrent_writes";
+    static constexpr auto inputType = common::LogicalTypeID::BOOL;
+    static void setContext(ClientContext* context, const common::Value& parameter);
+    static common::Value getSetting(const ClientContext* context);
+};
+
 struct ExperimentalConcurrentWritesSetting {
     static constexpr auto name = "experimental_concurrent_writes";
     static constexpr auto inputType = common::LogicalTypeID::BOOL;

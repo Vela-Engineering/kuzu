@@ -10,7 +10,7 @@ namespace kuzu {
 namespace main {
 
 #define GET_CONFIGURATION(_PARAM)                                                                  \
-    { _PARAM::name, _PARAM::inputType, _PARAM::setContext, _PARAM::getSetting }
+    {_PARAM::name, _PARAM::inputType, _PARAM::setContext, _PARAM::getSetting}
 
 static ConfigurationOption options[] = { // NOLINT(cert-err58-cpp):
     GET_CONFIGURATION(ThreadsSetting), GET_CONFIGURATION(TimeoutSetting),
@@ -19,7 +19,7 @@ static ConfigurationOption options[] = { // NOLINT(cert-err58-cpp):
     GET_CONFIGURATION(DisableMapKeyCheck), GET_CONFIGURATION(EnableZoneMapSetting),
     GET_CONFIGURATION(HomeDirectorySetting), GET_CONFIGURATION(FileSearchPathSetting),
     GET_CONFIGURATION(ProgressBarSetting), GET_CONFIGURATION(RecursivePatternSemanticSetting),
-    GET_CONFIGURATION(RecursivePatternFactorSetting),
+    GET_CONFIGURATION(RecursivePatternFactorSetting), GET_CONFIGURATION(ConcurrentWritesSetting),
     GET_CONFIGURATION(ExperimentalConcurrentWritesSetting),
     GET_CONFIGURATION(CheckpointThresholdSetting), GET_CONFIGURATION(AutoCheckpointSetting),
     GET_CONFIGURATION(ForceCheckpointClosingDBSetting), GET_CONFIGURATION(SpillToDiskSetting),
@@ -28,7 +28,7 @@ static ConfigurationOption options[] = { // NOLINT(cert-err58-cpp):
 DBConfig::DBConfig(const SystemConfig& systemConfig)
     : bufferPoolSize{systemConfig.bufferPoolSize}, maxNumThreads{systemConfig.maxNumThreads},
       enableCompression{systemConfig.enableCompression}, readOnly{systemConfig.readOnly},
-      maxDBSize{systemConfig.maxDBSize}, experimentalConcurrentWrites{false},
+      maxDBSize{systemConfig.maxDBSize}, concurrentWrites{true}, experimentalConcurrentWrites{true},
       autoCheckpoint{systemConfig.autoCheckpoint},
       checkpointThreshold{systemConfig.checkpointThreshold},
       forceCheckpointOnClose{systemConfig.forceCheckpointOnClose},

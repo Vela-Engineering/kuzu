@@ -139,14 +139,33 @@ common::Value RecursivePatternFactorSetting::getSetting(const ClientContext* con
         context->getClientConfig()->recursivePatternCardinalityScaleFactor);
 }
 
+static void setConcurrentWrites(ClientContext* context, const common::Value& parameter) {
+    parameter.validateType(ConcurrentWritesSetting::inputType);
+    const auto enabled = parameter.getValue<bool>();
+    context->getDBConfigUnsafe()->concurrentWrites.store(enabled, std::memory_order_release);
+    context->getDBConfigUnsafe()->experimentalConcurrentWrites.store(enabled,
+        std::memory_order_release);
+}
+
+static common::Value getConcurrentWrites(const ClientContext* context) {
+    return common::Value(context->getDBConfig()->allowConcurrentWrites());
+}
+
+void ConcurrentWritesSetting::setContext(ClientContext* context, const common::Value& parameter) {
+    setConcurrentWrites(context, parameter);
+}
+
+common::Value ConcurrentWritesSetting::getSetting(const ClientContext* context) {
+    return getConcurrentWrites(context);
+}
+
 void ExperimentalConcurrentWritesSetting::setContext(ClientContext* context,
     const common::Value& parameter) {
-    parameter.validateType(inputType);
-    context->getDBConfigUnsafe()->experimentalConcurrentWrites = parameter.getValue<bool>();
+    setConcurrentWrites(context, parameter);
 }
 
 common::Value ExperimentalConcurrentWritesSetting::getSetting(const ClientContext* context) {
-    return common::Value(context->getDBConfig()->experimentalConcurrentWrites);
+    return getConcurrentWrites(context);
 }
 
 void CheckpointThresholdSetting::setContext(ClientContext* context,

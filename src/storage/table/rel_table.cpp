@@ -197,19 +197,6 @@ void RelTable::insert(Transaction* transaction, TableInsertState& insertState) {
     KU_ASSERT(transaction->getLocalStorage());
     const auto localTable = transaction->getLocalStorage()->getOrCreateLocalTable(*this);
     localTable->insert(transaction, insertState);
-    if (insertState.logToWAL && transaction->shouldLogToWAL()) {
-        KU_ASSERT(transaction->isWriteTransaction());
-        const auto& relInsertState = insertState.cast<RelTableInsertState>();
-        std::vector<ValueVector*> vectorsToLog;
-        vectorsToLog.push_back(&relInsertState.srcNodeIDVector);
-        vectorsToLog.push_back(&relInsertState.dstNodeIDVector);
-        vectorsToLog.insert(vectorsToLog.end(), relInsertState.propertyVectors.begin(),
-            relInsertState.propertyVectors.end());
-        KU_ASSERT(relInsertState.srcNodeIDVector.state->getSelVector().getSelSize() == 1);
-        auto& wal = transaction->getLocalWAL();
-        wal.logTableInsertion(tableID, TableType::REL,
-            relInsertState.srcNodeIDVector.state->getSelVector().getSelSize(), vectorsToLog);
-    }
     setHasChanges();
 }
 
@@ -217,8 +204,9 @@ void RelTable::update(Transaction* transaction, TableUpdateState& updateState) {
     const auto& relUpdateState = updateState.cast<RelTableUpdateState>();
     KU_ASSERT(relUpdateState.relIDVector.state->getSelVector().getSelSize() == 1);
     const auto relIDPos = relUpdateState.relIDVector.state->getSelVector()[0];
-    if (const auto relOffset = relUpdateState.relIDVector.readNodeOffset(relIDPos);
-        relOffset >= StorageConstants::MAX_NUM_ROWS_IN_TABLE) {
+    const auto relOffset = relUpdateState.relIDVector.readNodeOffset(relIDPos);
+    const auto isLocalRel = relOffset >= StorageConstants::MAX_NUM_ROWS_IN_TABLE;
+    if (isLocalRel) {
         const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
         KU_ASSERT(localTable);
         localTable->update(&DUMMY_TRANSACTION, updateState);
@@ -229,7 +217,7 @@ void RelTable::update(Transaction* transaction, TableUpdateState& updateState) {
                 relUpdateState.relIDVector, relUpdateState.columnID, relUpdateState.propertyVector);
         }
     }
-    if (updateState.logToWAL && transaction->shouldLogToWAL()) {
+    if (!isLocalRel && updateState.logToWAL && transaction->shouldLogToWAL()) {
         KU_ASSERT(transaction->isWriteTransaction());
         auto& wal = transaction->getLocalWAL();
         wal.logRelUpdate(tableID, relUpdateState.columnID, &relUpdateState.srcNodeIDVector,
@@ -244,8 +232,9 @@ bool RelTable::delete_(Transaction* transaction, TableDeleteState& deleteState) 
     KU_ASSERT(relDeleteState.relIDVector.state->getSelVector().getSelSize() == 1);
     const auto relIDPos = relDeleteState.relIDVector.state->getSelVector()[0];
     bool isDeleted = false;
-    if (const auto relOffset = relDeleteState.relIDVector.readNodeOffset(relIDPos);
-        relOffset >= StorageConstants::MAX_NUM_ROWS_IN_TABLE) {
+    const auto relOffset = relDeleteState.relIDVector.readNodeOffset(relIDPos);
+    const auto isLocalRel = relOffset >= StorageConstants::MAX_NUM_ROWS_IN_TABLE;
+    if (isLocalRel) {
         const auto localTable = transaction->getLocalStorage()->getLocalTable(tableID);
         KU_ASSERT(localTable);
         isDeleted = localTable->delete_(transaction, deleteState);
@@ -261,7 +250,7 @@ bool RelTable::delete_(Transaction* transaction, TableDeleteState& deleteState) 
     }
     if (isDeleted) {
         setHasChanges();
-        if (deleteState.logToWAL && transaction->shouldLogToWAL()) {
+        if (!isLocalRel && deleteState.logToWAL && transaction->shouldLogToWAL()) {
             KU_ASSERT(transaction->isWriteTransaction());
             auto& wal = transaction->getLocalWAL();
             wal.logRelDelete(tableID, &relDeleteState.srcNodeIDVector,
@@ -413,16 +402,15 @@ void RelTable::commit(main::ClientContext* context, TableCatalogEntry* tableEntr
         localTable->clear(*MemoryManager::Get(*context));
         return;
     }
+    auto transaction = transaction::Transaction::Get(*context);
+    const auto activeRows = localRelTable.getActiveRows();
     // Update relID in local storage.
-    updateRelOffsets(localRelTable);
+    updateRelOffsets(localRelTable, activeRows);
+    if (transaction->shouldLogToWAL()) {
+        localRelTable.logInsertionsToWAL(transaction->getLocalWAL(), *MemoryManager::Get(*context));
+    }
     // For both forward and backward directions, re-org local storage into compact CSR node groups.
     auto& localNodeGroup = localRelTable.getLocalNodeGroup();
-    // Scan from local node group and write to WAL.
-    std::vector<column_id_t> columnIDsToScan;
-    for (auto i = 0u; i < localRelTable.getNumColumns(); i++) {
-        columnIDsToScan.push_back(i);
-    }
-
     std::vector<column_id_t> columnIDsToCommit;
     columnIDsToCommit.push_back(0); // NBR column.
     for (auto& property : tableEntry->getProperties()) {
@@ -430,7 +418,6 @@ void RelTable::commit(main::ClientContext* context, TableCatalogEntry* tableEntr
         columnIDsToCommit.push_back(columnID);
     }
     // commit rel table data
-    auto transaction = transaction::Transaction::Get(*context);
     for (auto& relData : directedRelData) {
         const auto direction = relData->getDirection();
         const auto columnToSkip = (direction == RelDataDirection::FWD) ?
@@ -457,28 +444,21 @@ void RelTable::reclaimStorage(PageAllocator& pageAllocator) const {
     }
 }
 
-void RelTable::updateRelOffsets(const LocalRelTable& localRelTable) {
+void RelTable::updateRelOffsets(const LocalRelTable& localRelTable,
+    const row_idx_vec_t& activeRows) {
     auto& localNodeGroup = localRelTable.getLocalNodeGroup();
-    const offset_t maxCommittedOffset = reserveRelOffsets(localNodeGroup.getNumRows());
-    RUNTIME_CHECK(uint64_t totalNumRows = 0);
+    const offset_t maxCommittedOffset = reserveRelOffsets(activeRows.size());
     for (auto i = 0u; i < localNodeGroup.getNumChunkedGroups(); i++) {
-        const auto chunkedGroup = localNodeGroup.getChunkedNodeGroup(i);
-        KU_ASSERT(chunkedGroup);
-        auto& internalIDChunk = chunkedGroup->getColumnChunk(LOCAL_REL_ID_COLUMN_ID);
-        RUNTIME_CHECK(totalNumRows += internalIDChunk.getNumValues());
-        for (auto rowIdx = 0u; rowIdx < internalIDChunk.getNumValues(); rowIdx++) {
-            const auto localRelOffset = internalIDChunk.getValue<offset_t>(rowIdx);
-            const auto committedRelOffset = getCommittedOffset(localRelOffset, maxCommittedOffset);
-            internalIDChunk.setValue<offset_t>(committedRelOffset, rowIdx);
-        }
-
-        internalIDChunk.setTableID(tableID);
+        localNodeGroup.getChunkedNodeGroup(i)
+            ->getColumnChunk(LOCAL_REL_ID_COLUMN_ID)
+            .setTableID(tableID);
     }
-    KU_ASSERT(totalNumRows == localNodeGroup.getNumRows());
-}
-
-offset_t RelTable::getCommittedOffset(offset_t uncommittedOffset, offset_t maxCommittedOffset) {
-    return uncommittedOffset - StorageConstants::MAX_NUM_ROWS_IN_TABLE + maxCommittedOffset;
+    for (auto i = 0u; i < activeRows.size(); i++) {
+        const auto [chunkedGroup, rowIdxInGroup] =
+            localRelTable.getChunkedGroupAndRow(activeRows[i]);
+        auto& internalIDChunk = chunkedGroup->getColumnChunk(LOCAL_REL_ID_COLUMN_ID);
+        internalIDChunk.setValue<offset_t>(maxCommittedOffset + i, rowIdxInGroup);
+    }
 }
 
 void RelTable::prepareCommitForNodeGroup(const Transaction* transaction,
@@ -503,8 +483,8 @@ void RelTable::prepareCommitForNodeGroup(const Transaction* transaction,
 
 bool RelTable::checkpoint(main::ClientContext*, TableCatalogEntry* tableEntry,
     PageAllocator& pageAllocator, const Transaction* snapshotTxn, uint64_t epochWatermark) {
-    const auto effectiveEpoch = epochWatermark > 0 ? epochWatermark :
-        changeEpoch.load(std::memory_order_acquire);
+    const auto effectiveEpoch =
+        epochWatermark > 0 ? epochWatermark : changeEpoch.load(std::memory_order_acquire);
     if (effectiveEpoch <= lastCheckpointedEpoch) {
         return false;
     }
