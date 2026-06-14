@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -68,16 +69,14 @@ private:
     void clearAutoCheckpointErrorMessage();
     void setAutoCheckpointErrorMessage(std::string errorMessage);
 
-    // This function locks the mutex to stop new write transactions and waits until all active
-    // write transactions leave the system. Read transactions are allowed to continue, as
-    // checkpoint does not need to wait for snapshot-isolated readers.
-    common::UniqLock stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
+    common::UniqLock stopNewTransactionsAndWaitUntilAllTransactionsLeave();
 
     bool hasActiveWriteTransactionNoLock() const {
         return activeWriteTransactionCount.load(std::memory_order_acquire) > 0;
     }
 
     void decrementActiveWriteTransactionCount();
+    void decrementActiveTransactionCount();
 
     // Note: Used by DBTest::createDB only.
     void setCheckPointWaitTimeoutForTransactionsToLeaveInMicros(uint64_t waitTimeInMicros) {
@@ -96,13 +95,12 @@ private:
     std::mutex mtxForSerializingPublicFunctionCalls;
     std::mutex mtxForStartingNewTransactions;
     // Prevents concurrent checkpoints. Separate from mtxForSerializingPublicFunctionCalls so
-    // that active writers can commit/rollback while the checkpoint is draining them.
+    // that active transactions can commit/rollback while the checkpoint is draining them.
     std::mutex mtxForCheckpoint;
-    // protects condition-variable waits for active write transactions to reach zero.
-    std::mutex mtxForActiveWriteTransactions;
-    std::condition_variable cvActiveWriteTransactionsChanged;
-    // active write/recovery transaction count used by checkpoint drain waits without holding
-    // mtxForSerializingPublicFunctionCalls, which would deadlock.
+    std::mutex mtxForActiveTransactions;
+    std::condition_variable cvActiveTransactionsChanged;
+    std::atomic<uint32_t> activeTransactionCount{0};
+    // active write/recovery transaction count used to enforce single-writer mode.
     std::atomic<uint32_t> activeWriteTransactionCount{0};
     uint64_t checkpointWaitTimeoutInMicros = common::DEFAULT_CHECKPOINT_WAIT_TIMEOUT_IN_MICROS;
 

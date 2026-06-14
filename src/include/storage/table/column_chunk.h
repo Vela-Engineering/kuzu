@@ -31,8 +31,8 @@ struct ChunkCheckpointState {
 struct SegmentCheckpointState {
     SegmentCheckpointState(const ColumnChunkData& chunkData, common::row_idx_t startRowInData,
         common::row_idx_t offsetInSegment, common::row_idx_t numRows)
-        : chunkData{chunkData}, startRowInData{startRowInData},
-          offsetInSegment{offsetInSegment}, numRows{numRows} {}
+        : chunkData{chunkData}, startRowInData{startRowInData}, offsetInSegment{offsetInSegment},
+          numRows{numRows} {}
 
     const ColumnChunkData& chunkData;
     common::row_idx_t startRowInData;
@@ -265,7 +265,7 @@ public:
         auto [segment, offsetInSegment] = genericFindSegment(std::span(data), pos);
         KU_ASSERT(segment->get() != nullptr);
         KU_ASSERT((*segment)->getResidencyState() == ResidencyState::IN_MEMORY);
-        (*segment)->template setValue<T>(val, pos);
+        (*segment)->template setValue<T>(val, offsetInSegment);
     }
 
     void flush(PageAllocator& pageAllocator) {

@@ -51,7 +51,8 @@ jobs:
 
       - name: Detect release version
         run: |
-          echo "RELEASE_VERSION=v$(cat CMakeLists.txt | grep "DKUZU_EXTENSION_VERSION" | cut -d '"' -f 2 )" >> $GITHUB_ENV
+          EXTENSION_VERSION=$(python3 scripts/extension_version.py)
+          echo "RELEASE_VERSION=v${EXTENSION_VERSION}" >> $GITHUB_ENV
 
       - name: Delete checked out repository
         run: rm -rf ./*

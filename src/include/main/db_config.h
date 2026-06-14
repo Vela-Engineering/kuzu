@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 
 #include "common/types/value/value.h"
@@ -59,7 +60,8 @@ struct DBConfig {
     bool enableCompression;
     bool readOnly;
     uint64_t maxDBSize;
-    bool experimentalConcurrentWrites;
+    std::atomic<bool> concurrentWrites;
+    std::atomic<bool> experimentalConcurrentWrites;
     bool autoCheckpoint;
     uint64_t checkpointThreshold;
     bool forceCheckpointOnClose;
@@ -71,6 +73,10 @@ struct DBConfig {
 #endif
 
     explicit DBConfig(const SystemConfig& systemConfig);
+    bool allowConcurrentWrites() const {
+        return concurrentWrites.load(std::memory_order_acquire) &&
+               experimentalConcurrentWrites.load(std::memory_order_acquire);
+    }
 
     static ConfigurationOption* getOptionByName(const std::string& optionName);
     KUZU_API static bool isDBPathInMemory(const std::string& dbPath);

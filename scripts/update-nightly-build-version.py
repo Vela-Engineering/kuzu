@@ -1,8 +1,8 @@
 PYPI_URL = "https://pypi.org/pypi/kuzu/json"
 CMAKE_KEYWORD = "project(Kuzu VERSION "
 CMAKE_SUFFIX = " LANGUAGES CXX C)\n"
-EXTENSION_KEYWORD = 'add_definitions(-DKUZU_EXTENSION_VERSION="'
-EXTENSION_SUFFIX = '")\n'
+EXTENSION_VERSION_KEYWORD = "set(KUZU_EXTENSION_VERSION \""
+EXTENSION_VERSION_SUFFIX = "\")\n"
 EXTENSION_DEV_VERSION = "dev"
 
 import urllib.request
@@ -52,8 +52,8 @@ def main():
         if CMAKE_KEYWORD in line:
             cmake_lists[i] = CMAKE_KEYWORD + cmake_version + CMAKE_SUFFIX
             counter -= 1
-        if EXTENSION_KEYWORD in line:
-            cmake_lists[i] = EXTENSION_KEYWORD + EXTENSION_DEV_VERSION + EXTENSION_SUFFIX
+        if EXTENSION_VERSION_KEYWORD in line:
+            cmake_lists[i] = EXTENSION_VERSION_KEYWORD + EXTENSION_DEV_VERSION + EXTENSION_VERSION_SUFFIX
             counter -= 1
         if counter == 0:
             break

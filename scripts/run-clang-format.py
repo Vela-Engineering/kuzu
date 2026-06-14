@@ -18,6 +18,7 @@ import fnmatch
 import io
 import multiprocessing
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -31,6 +32,48 @@ except ImportError:
 
 DEFAULT_EXTENSIONS = 'c,h,C,H,cpp,hpp,cc,hh,c++,h++,cxx,hxx'
 DEFAULT_CLANG_FORMAT_IGNORE = '.clang-format-ignore'
+
+
+def find_default_clang_format():
+    env_clang_format = os.environ.get('CLANG_FORMAT')
+    if env_clang_format:
+        return env_clang_format
+    candidates = [
+        'clang-format-18',
+        'clang-format-21',
+        'clang-format-20',
+        'clang-format-19',
+        'clang-format-17',
+        'clang-format-16',
+        'clang-format-15',
+        'clang-format-14',
+        'clang-format-12',
+    ]
+    homebrew_packages = [
+        'llvm@18',
+        'llvm',
+        'llvm@21',
+        'llvm@20',
+        'llvm@19',
+        'llvm@17',
+        'llvm@16',
+        'llvm@15',
+        'llvm@14',
+        'llvm@12',
+    ]
+    for prefix in ('/opt/homebrew/opt', '/usr/local/opt'):
+        for package in homebrew_packages:
+            candidates.append(os.path.join(prefix, package, 'bin', 'clang-format'))
+    candidates.append('clang-format')
+    for candidate in candidates:
+        if os.path.isabs(candidate):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return 'clang-format-18'
 
 
 class ExitStatus:
@@ -254,7 +297,7 @@ def main():
         '--clang-format-executable',
         metavar='EXECUTABLE',
         help='path to the clang-format executable',
-        default='clang-format-11')
+        default=find_default_clang_format())
     parser.add_argument(
         '--extensions',
         help='comma separated list of file extensions (default: {})'.format(

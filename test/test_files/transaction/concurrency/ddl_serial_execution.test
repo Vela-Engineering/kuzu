@@ -2,6 +2,8 @@
 --
 
 -CASE MultiWritesException
+-STATEMENT CALL concurrent_writes=false;
+---- ok
 -STATEMENT BEGIN TRANSACTION;
 ---- ok
 -STATEMENT CREATE NODE TABLE t(a INT, b INT, PRIMARY KEY(a));
@@ -17,10 +19,34 @@ Cannot start a new write transaction in the system. Only one write transaction a
 0|a|INT32|NULL|True
 1|b|INT32|NULL|False
 
-# test CALL experimental_concurrent_writes=true
--CASE EnableExperimentalConcurrentWrites
+-CASE LegacyConcurrentWritesKillSwitch
+-STATEMENT CALL experimental_concurrent_writes=false;
+---- ok
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT CREATE NODE TABLE legacy_t(a INT, b INT, PRIMARY KEY(a));
+---- ok
+-CREATE_CONNECTION conn2
+-STATEMENT [conn2] BEGIN TRANSACTION;
+---- error
+Cannot start a new write transaction in the system. Only one write transaction at a time is allowed in the system.
+-STATEMENT COMMIT;
+---- ok
+
+-CASE ConcurrentWritesSettingCompatibility
+-STATEMENT CALL current_setting('concurrent_writes') RETURN *;
+---- 1
+True
+-STATEMENT CALL concurrent_writes=false;
+---- ok
+-STATEMENT CALL current_setting('experimental_concurrent_writes') RETURN *;
+---- 1
+False
 -STATEMENT CALL experimental_concurrent_writes=true;
 ---- ok
+-STATEMENT CALL current_setting('concurrent_writes') RETURN *;
+---- 1
+True
 -STATEMENT BEGIN TRANSACTION;
 ---- ok
 -STATEMENT CREATE NODE TABLE t(a INT, b INT, PRIMARY KEY(a));

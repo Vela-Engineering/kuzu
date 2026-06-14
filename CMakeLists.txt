@@ -410,7 +410,8 @@ add_subdirectory(third_party)
 
 add_definitions(-DKUZU_ROOT_DIRECTORY="${PROJECT_SOURCE_DIR}")
 add_definitions(-DKUZU_CMAKE_VERSION="${CMAKE_PROJECT_VERSION}")
-add_definitions(-DKUZU_EXTENSION_VERSION="0.11.1")
+set(KUZU_EXTENSION_VERSION "${CMAKE_PROJECT_VERSION}")
+add_definitions(-DKUZU_EXTENSION_VERSION="${KUZU_EXTENSION_VERSION}")
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/extension/CMakeLists.txt")
     add_subdirectory(extension)

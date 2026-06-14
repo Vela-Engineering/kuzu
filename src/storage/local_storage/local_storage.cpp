@@ -59,11 +59,20 @@ void LocalStorage::commit() {
     auto catalog = catalog::Catalog::Get(clientContext);
     auto transaction = transaction::Transaction::Get(clientContext);
     auto storageManager = StorageManager::Get(clientContext);
+    local_node_offset_map_t nodeOffsetMap;
     for (auto& [tableID, localTable] : tables) {
         if (localTable->getTableType() == TableType::NODE) {
             const auto tableEntry = catalog->getTableCatalogEntry(transaction, tableID);
             const auto table = storageManager->getTable(tableID);
+            const auto& localNodeTable = localTable->cast<LocalNodeTable>();
+            const auto oldStartOffset = localNodeTable.getStartOffset();
+            const auto newStartOffset = table->getNumTotalRows(nullptr /* transaction */);
+            const auto numRows = localTable->getNumTotalRows();
             table->commit(&clientContext, tableEntry, localTable.get());
+            if (numRows > 0) {
+                nodeOffsetMap[tableID] =
+                    LocalNodeOffsetMap{oldStartOffset, newStartOffset, numRows};
+            }
         }
     }
     for (auto& [tableID, localTable] : tables) {
@@ -71,6 +80,7 @@ void LocalStorage::commit() {
             const auto table = storageManager->getTable(tableID);
             const auto tableEntry =
                 catalog->getTableCatalogEntry(transaction, table->cast<RelTable>().getRelGroupID());
+            localTable->cast<LocalRelTable>().remapNodeOffsets(nodeOffsetMap);
             table->commit(&clientContext, tableEntry, localTable.get());
         }
     }

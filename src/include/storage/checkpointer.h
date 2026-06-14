@@ -37,12 +37,10 @@ public:
 
     void writeCheckpoint();
     void beginCheckpoint(common::transaction_t snapshotTS);
-    // Storage materialization phase. Safe to call after the write gate is released.
-    // Uses the snapshot transaction for MVCC-consistent version chain traversal.
+    // Storage materialization phase for the snapshot captured by beginCheckpoint().
     void checkpointStoragePhase();
     void finishCheckpoint();
-    // Cleanup after the core checkpoint that does not require the write gate.
-    // Safe to call while new writers are active.
+    // Cleanup after the core checkpoint.
     void postCheckpointCleanup();
     void rollback();
     bool wasWalRotated() const { return walRotated; }
@@ -69,7 +67,6 @@ private:
     PageRange serializeMetadata(const catalog::Catalog& catalog, StorageManager& storageManager);
     PageRange serializeMetadataSnapshot(const catalog::Catalog& catalog,
         StorageManager& storageManager);
-    bool snapshotTableEpochsStillValid() const;
 
 protected:
     main::ClientContext& clientContext;
@@ -81,16 +78,12 @@ protected:
     DatabaseHeader checkpointHeader{};
     // Whether storage had changes during checkpointStorage.
     bool hasStorageChanges = false;
-    // Versions captured at the end of writeCheckpoint() while the write gate is still held.
-    // Used by postCheckpointCleanup() to safely reset version tracking without losing
-    // concurrent version bumps from writers that started after the gate was released.
+    // Versions restored by postCheckpointCleanup() after checkpoint-owned version bumps.
     uint64_t catalogVersionAtCheckpoint = 0;
     uint64_t pageManagerVersionAtCheckpoint = 0;
-    // Per-table changeEpoch watermarks captured under the write gate.
-    // Used to avoid clearing post-snapshot dirty signals from concurrent writers.
+    // Per-table changeEpoch watermarks captured under the transaction gate.
+    // Used as the stable epoch for snapshot checkpointing.
     std::unordered_map<common::table_id_t, uint64_t> tableEpochWatermarks;
-    common::UniqLock storageCheckpointWriteGate;
-    bool snapshotInvalidatedByConcurrentWrite = false;
 };
 
 } // namespace storage

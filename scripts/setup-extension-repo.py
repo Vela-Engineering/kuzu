@@ -4,16 +4,8 @@ import sys
 import platform
 import requests
 
-def extract_extension_version() -> str:
-    import re
-    pattern = r'-DKUZU_EXTENSION_VERSION=(["\'])(.*?)\1'
-    with open('./CMakeLists.txt', 'r') as f:
-        for line in f:
-            match = re.search(pattern, line)
-            if match:
-                version = match.group(2)
-                return version
-    raise Exception("Failed to infer KUZU extension version from CMAKE file.")
+from extension_version import extract_extension_version
+
 
 
 def get_os() -> str:
@@ -33,7 +25,7 @@ def get_arch() -> str:
 
 
 extension_repo_path = 'extension/repo'
-kuzu_version = 'v' + extract_extension_version()
+kuzu_version = 'v' + extract_extension_version('./CMakeLists.txt')
 arch_version = f"{get_os()}_{get_arch()}"
 shutil.rmtree(extension_repo_path, ignore_errors=True)
 os.mkdir(extension_repo_path)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <unordered_map>
 
 #include "common/enums/rel_direction.h"
 #include "storage/local_storage/local_table.h"
@@ -8,6 +9,7 @@
 
 namespace kuzu {
 namespace storage {
+class LocalWAL;
 class MemoryManager;
 
 static constexpr common::column_id_t LOCAL_BOUND_NODE_ID_COLUMN_ID = 0;
@@ -29,6 +31,14 @@ struct DirectedCSRIndex {
     common::RelDataDirection direction;
     index_t index;
 };
+
+struct LocalNodeOffsetMap {
+    common::offset_t oldStartOffset;
+    common::offset_t newStartOffset;
+    common::row_idx_t numRows;
+};
+
+using local_node_offset_map_t = std::unordered_map<common::table_id_t, LocalNodeOffsetMap>;
 
 class LocalRelTable final : public LocalTable {
 public:
@@ -57,8 +67,7 @@ public:
     }
     bool isEmpty() const {
         KU_ASSERT(directedIndices.size() >= 1);
-        RUNTIME_CHECK(for (const auto& index
-                           : directedIndices) {
+        RUNTIME_CHECK(for (const auto& index : directedIndices) {
             KU_ASSERT(index.index.empty() == directedIndices[0].index.empty());
         });
         return directedIndices[0].isEmpty();
@@ -66,6 +75,12 @@ public:
 
     common::column_id_t getNumColumns() const { return localNodeGroup->getDataTypes().size(); }
     common::row_idx_t getNumTotalRows() override { return localNodeGroup->getNumRows(); }
+
+    void remapNodeOffsets(const local_node_offset_map_t& offsetMap);
+    void logInsertionsToWAL(LocalWAL& wal, MemoryManager& mm) const;
+    row_idx_vec_t getActiveRows() const;
+    std::pair<ChunkedNodeGroup*, common::row_idx_t> getChunkedGroupAndRow(
+        common::row_idx_t rowIdx) const;
 
     DirectedCSRIndex::index_t& getCSRIndex(common::RelDataDirection direction) {
         const auto directionIdx = common::RelDirectionUtils::relDirectionToKeyIdx(direction);

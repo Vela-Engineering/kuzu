@@ -17,6 +17,31 @@ False
 ---- 1
 True
 
+-LOG SetGetConcurrentWrites
+-STATEMENT CALL current_setting('concurrent_writes') RETURN *
+---- 1
+True
+-STATEMENT CALL concurrent_writes=false
+---- ok
+-STATEMENT CALL current_setting('concurrent_writes') RETURN *
+---- 1
+False
+-STATEMENT CALL concurrent_writes=true
+---- ok
+-STATEMENT CALL current_setting('experimental_concurrent_writes') RETURN *
+---- 1
+True
+-STATEMENT CALL experimental_concurrent_writes=false
+---- ok
+-STATEMENT CALL current_setting('concurrent_writes') RETURN *
+---- 1
+False
+-STATEMENT CALL concurrent_writes=true
+---- ok
+-STATEMENT CALL current_setting('experimental_concurrent_writes') RETURN *
+---- 1
+True
+
 -LOG SetGetThread
 -STATEMENT CALL THREADS=4
 ---- ok

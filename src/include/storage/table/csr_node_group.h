@@ -2,6 +2,7 @@
 
 #include <array>
 #include <bitset>
+#include <mutex>
 
 #include "common/constants.h"
 #include "common/system_config.h"
@@ -228,7 +229,7 @@ private:
         CSRNodeGroupScanState& nodeGroupScanState);
 
     void updateCSRIndex(common::offset_t boundNodeOffsetInGroup, common::row_idx_t startRow,
-        common::length_t length) const;
+        common::length_t length);
 
     NodeGroupScanResult scanCommittedPersistent(const transaction::Transaction* transaction,
         RelTableScanState& tableState, CSRNodeGroupScanState& nodeGroupScanState) const;
@@ -285,6 +286,7 @@ private:
 private:
     std::unique_ptr<ChunkedNodeGroup> persistentChunkGroup;
     std::unique_ptr<CSRIndex> csrIndex;
+    mutable std::mutex csrIndexMtx;
 };
 
 } // namespace storage

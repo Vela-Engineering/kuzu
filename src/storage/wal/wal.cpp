@@ -113,6 +113,9 @@ void WAL::flushAndSyncNoLock() {
 
 uint64_t WAL::getFileSize() {
     std::unique_lock lck{mtx};
+    if (!serializer) {
+        return 0;
+    }
     return serializer->getWriter()->getSize();
 }
 

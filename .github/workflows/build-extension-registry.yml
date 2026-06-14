@@ -2,6 +2,16 @@ name: Build Extension Registry
 
 on:
   workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - CMakeLists.txt
+      - extension/fts/**
+      - scripts/collect-extensions.py
+      - scripts/extension/PRODUCTION_RELEASES
+      - scripts/extension_version.py
+      - scripts/preserve-extension-registry.py
+      - .github/workflows/build-extension-registry.yml
 
 permissions:
   contents: read
@@ -28,7 +38,7 @@ jobs:
       - name: Collect registry files
         run: |
           python3 scripts/collect-extensions.py
-          EXTENSION_VERSION=$(grep -m1 'DKUZU_EXTENSION_VERSION' CMakeLists.txt | cut -d '"' -f 2)
+          EXTENSION_VERSION=$(python3 scripts/extension_version.py)
           mkdir -p registry/v${EXTENSION_VERSION}/linux_amd64
           cp -R extension-artifacts/fts registry/v${EXTENSION_VERSION}/linux_amd64/
 
@@ -52,7 +62,7 @@ jobs:
       - name: Collect registry files
         run: |
           python3 scripts/collect-extensions.py
-          EXTENSION_VERSION=$(grep -m1 'DKUZU_EXTENSION_VERSION' CMakeLists.txt | cut -d '"' -f 2)
+          EXTENSION_VERSION=$(python3 scripts/extension_version.py)
           mkdir -p registry/v${EXTENSION_VERSION}/linux_arm64
           cp -R extension-artifacts/fts registry/v${EXTENSION_VERSION}/linux_arm64/
 
@@ -78,7 +88,7 @@ jobs:
       - name: Collect registry files
         run: |
           python3 scripts/collect-extensions.py
-          EXTENSION_VERSION=$(grep -m1 'DKUZU_EXTENSION_VERSION' CMakeLists.txt | cut -d '"' -f 2)
+          EXTENSION_VERSION=$(python3 scripts/extension_version.py)
           mkdir -p registry/v${EXTENSION_VERSION}/osx_arm64
           cp -R extension-artifacts/fts registry/v${EXTENSION_VERSION}/osx_arm64/
 
@@ -87,22 +97,84 @@ jobs:
           name: registry-osx-arm64
           path: registry
 
+  build-macos-x86-registry:
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install cmake ninja
+
+      - name: Build FTS extension
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          CMAKE_OSX_ARCHITECTURES: "x86_64"
+        run: make extension-release EXTENSION_LIST=fts NUM_THREADS=$(sysctl -n hw.ncpu)
+
+      - name: Collect registry files
+        run: |
+          python3 scripts/collect-extensions.py
+          EXTENSION_VERSION=$(python3 scripts/extension_version.py)
+          mkdir -p registry/v${EXTENSION_VERSION}/osx_amd64
+          cp -R extension-artifacts/fts registry/v${EXTENSION_VERSION}/osx_amd64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: registry-osx-amd64
+          path: registry
+
+  build-windows-x86-registry:
+    runs-on: windows-2022
+    env:
+      NUM_THREADS: 4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: choco install make ninja -y --no-progress
+
+      - name: Build FTS extension
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          make extension-release EXTENSION_LIST=fts
+
+      - name: Collect registry files
+        shell: bash
+        run: |
+          python scripts/collect-extensions.py
+          EXTENSION_VERSION=$(python scripts/extension_version.py)
+          mkdir -p registry/v${EXTENSION_VERSION}/win_amd64
+          cp -R extension-artifacts/fts registry/v${EXTENSION_VERSION}/win_amd64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: registry-win-amd64
+          path: registry
+
   deploy-pages:
     runs-on: ubuntu-24.04
     needs:
       - build-linux-x86-registry
       - build-linux-arm-registry
       - build-macos-arm-registry
+      - build-macos-x86-registry
+      - build-windows-x86-registry
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download registry artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: registry-*
           path: public
           merge-multiple: true
+
+      - name: Preserve published registry artifacts
+        run: python3 scripts/preserve-extension-registry.py --output public
 
       - name: Add index
         run: |

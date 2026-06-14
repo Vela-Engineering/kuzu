@@ -21,23 +21,19 @@ TransactionManager::~TransactionManager() {
 
 Transaction* TransactionManager::beginTransaction(main::ClientContext& clientContext,
     TransactionType type) {
-    // only acquire the write gate for write/recovery transactions. Read-only transactions
-    // can start freely during checkpoint since they use snapshot isolation.
-    std::unique_lock newTransactionLck{mtxForStartingNewTransactions, std::defer_lock};
-    if (type != TransactionType::READ_ONLY) {
-        newTransactionLck.lock();
-    }
+    std::unique_lock newTransactionLck{mtxForStartingNewTransactions};
     std::unique_lock publicFunctionLck{mtxForSerializingPublicFunctionCalls};
     switch (type) {
     case TransactionType::READ_ONLY: {
         auto transaction =
             std::make_unique<Transaction>(clientContext, type, ++lastTransactionID, lastTimestamp);
         activeTransactions.push_back(std::move(transaction));
+        activeTransactionCount.fetch_add(1, std::memory_order_release);
         return activeTransactions.back().get();
     }
     case TransactionType::RECOVERY:
     case TransactionType::WRITE: {
-        if (!clientContext.getDBConfig()->experimentalConcurrentWrites &&
+        if (!clientContext.getDBConfig()->allowConcurrentWrites() &&
             hasActiveWriteTransactionNoLock()) {
             throw TransactionManagerException(
                 "Cannot start a new write transaction in the system. "
@@ -49,6 +45,7 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
             transaction->getLocalWAL().logBeginTransaction();
         }
         activeTransactions.push_back(std::move(transaction));
+        activeTransactionCount.fetch_add(1, std::memory_order_release);
         activeWriteTransactionCount.fetch_add(1, std::memory_order_release);
         return activeTransactions.back().get();
     }
@@ -137,24 +134,28 @@ TransactionManager* TransactionManager::Get(const main::ClientContext& context) 
     return context.getDatabase()->getTransactionManager();
 }
 
-UniqLock TransactionManager::stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave() {
+UniqLock TransactionManager::stopNewTransactionsAndWaitUntilAllTransactionsLeave() {
     UniqLock startTransactionLock{mtxForStartingNewTransactions};
-    std::unique_lock activeWriteTransactionsLck{mtxForActiveWriteTransactions};
+    std::unique_lock activeTransactionsLck{mtxForActiveTransactions};
     const auto timeout = std::chrono::microseconds(checkpointWaitTimeoutInMicros);
-    if (!cvActiveWriteTransactionsChanged.wait_for(activeWriteTransactionsLck, timeout,
-            [&]() { return !hasActiveWriteTransactionNoLock(); })) {
+    if (!cvActiveTransactionsChanged.wait_for(activeTransactionsLck, timeout,
+            [&]() { return activeTransactionCount.load(std::memory_order_acquire) == 0; })) {
         throw TransactionManagerException(
-            "Timeout waiting for active write transactions to leave the system before "
-            "checkpointing. If you have an open write transaction, please close it and "
+            "Timeout waiting for active transactions to leave the system before "
+            "checkpointing. If you have an open transaction, please close it and "
             "try again.");
     }
     return startTransactionLock;
 }
 
 void TransactionManager::decrementActiveWriteTransactionCount() {
-    if (activeWriteTransactionCount.fetch_sub(1, std::memory_order_release) == 1) {
-        std::lock_guard activeWriteTransactionsLck{mtxForActiveWriteTransactions};
-        cvActiveWriteTransactionsChanged.notify_all();
+    activeWriteTransactionCount.fetch_sub(1, std::memory_order_release);
+}
+
+void TransactionManager::decrementActiveTransactionCount() {
+    if (activeTransactionCount.fetch_sub(1, std::memory_order_release) == 1) {
+        std::lock_guard activeTransactionsLck{mtxForActiveTransactions};
+        cvActiveTransactionsChanged.notify_all();
     }
 }
 
@@ -166,6 +167,7 @@ void TransactionManager::clearTransactionNoLock(transaction_t transactionID) {
     std::erase_if(activeTransactions, [transactionID](const auto& activeTransaction) {
         return activeTransaction->getID() == transactionID;
     });
+    decrementActiveTransactionCount();
 }
 
 std::unique_ptr<Checkpointer> TransactionManager::initCheckpointer(
@@ -190,8 +192,8 @@ void TransactionManager::scheduleAutoCheckpoint(main::ClientContext& clientConte
     autoCheckpointRequested = true;
     if (!autoCheckpointWorker.joinable()) {
         auto database = clientContext.getDatabase();
-        autoCheckpointWorker = std::thread(
-            [this, database]() { runAutoCheckpointWorker(database); });
+        autoCheckpointWorker =
+            std::thread([this, database]() { runAutoCheckpointWorker(database); });
     }
     lck.unlock();
     cvAutoCheckpoint.notify_one();
@@ -266,16 +268,9 @@ void TransactionManager::shutdownAutoCheckpointWorker() {
 }
 
 void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
-    // We only need to wait for active write transactions to leave the system before
-    // checkpointing. Read transactions can continue safely because:
-    // 1. Readers use snapshot isolation (MVCC) and only see data committed before their startTS.
-    // 2. Shadow pages are applied with per-page locking, so concurrent optimistic readers will
-    //    detect the version change and retry their read with the updated page data.
-    // 3. The checkpoint only materializes already-committed data, which readers either already
-    //    see (if committed before their startTS) or correctly skip (if committed after).
-    UniqLock writeGate;
+    UniqLock transactionGate;
     try {
-        writeGate = stopNewWriteTransactionsAndWaitUntilAllWriteTransactionsLeave();
+        transactionGate = stopNewTransactionsAndWaitUntilAllTransactionsLeave();
     } catch (std::exception& e) {
         throw CheckpointException{e};
     }
@@ -291,16 +286,6 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
         checkpointer->rollback();
         throw CheckpointException{e};
     }
-    // Release the write gate early when WAL was rotated (common case). New writers
-    // create a fresh active WAL, isolated from the frozen checkpoint WAL. When WAL
-    // was not rotated (no WAL existed), keep the gate to prevent WAL races.
-    if (checkpointer->wasWalRotated()) {
-        writeGate = {};
-    }
-    // Storage materialization runs after the gate is released. Writers can start new
-    // transactions while tables are being checkpointed. Per-node-group locks provide
-    // fine-grained mutual exclusion, and the snapshot transaction ensures a consistent
-    // MVCC view of version chains.
     try {
         checkpointer->checkpointStoragePhase();
     } catch (std::exception& e) {
@@ -313,7 +298,6 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
         checkpointer->rollback();
         throw CheckpointException{e};
     }
-    writeGate = {};
     checkpointer->postCheckpointCleanup();
 }
 

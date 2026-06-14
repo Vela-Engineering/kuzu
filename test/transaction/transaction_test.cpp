@@ -1,8 +1,13 @@
+#include <atomic>
+#include <chrono>
 #include <fstream>
+#include <future>
+#include <thread>
 
 #include "api_test/api_test.h"
 #include "api_test/private_api_test.h"
 #include "main/attached_database.h"
+#include "main/database.h"
 #include "storage/storage_utils.h"
 #include "storage/wal/wal.h"
 #include "transaction/transaction_manager.h"
@@ -10,6 +15,28 @@
 using namespace kuzu::common;
 using namespace kuzu::testing;
 using namespace kuzu::transaction;
+
+TEST(DBConfigTest, AllowConcurrentWritesUsesBothCurrentAndLegacyFlags) {
+    kuzu::main::SystemConfig systemConfig;
+    kuzu::main::DBConfig config{systemConfig};
+
+    ASSERT_TRUE(config.allowConcurrentWrites());
+    config.concurrentWrites.store(true, std::memory_order_release);
+    config.experimentalConcurrentWrites.store(true, std::memory_order_release);
+    ASSERT_TRUE(config.allowConcurrentWrites());
+
+    config.concurrentWrites.store(false, std::memory_order_release);
+    config.experimentalConcurrentWrites.store(true, std::memory_order_release);
+    ASSERT_FALSE(config.allowConcurrentWrites());
+
+    config.concurrentWrites.store(true, std::memory_order_release);
+    config.experimentalConcurrentWrites.store(false, std::memory_order_release);
+    ASSERT_FALSE(config.allowConcurrentWrites());
+
+    config.concurrentWrites.store(false, std::memory_order_release);
+    config.experimentalConcurrentWrites.store(false, std::memory_order_release);
+    ASSERT_FALSE(config.allowConcurrentWrites());
+}
 
 TEST_F(PrivateApiTest, TransactionModes) {
     // Test initially connections are in AUTO_COMMIT mode.
@@ -143,8 +170,8 @@ TEST_F(EmptyDBTransactionTest, GetsAttachedDatabaseTransactionManager) {
         auto attachedDatabase =
             std::make_unique<kuzu::main::Database>(attachedDatabasePath, *systemConfig);
     }
-    auto result = conn->query(
-        stringFormat("ATTACH '{}' AS remote (DBTYPE KUZU);", attachedDatabasePath));
+    auto result =
+        conn->query(stringFormat("ATTACH '{}' AS remote (DBTYPE KUZU);", attachedDatabasePath));
     ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
 
     auto context = getClientContext(*conn);
@@ -167,6 +194,312 @@ static void insertNodes(uint64_t startID, uint64_t num, kuzu::main::Database& da
         ASSERT_TRUE(res->isSuccess())
             << "Failed to insert test" << id << ": " << res->getErrorMessage();
     }
+}
+
+static std::string executeAgentMemoryQuery(kuzu::main::Connection& conn, const std::string& query) {
+    auto result = conn.query(query);
+    if (!result->isSuccess()) {
+        return stringFormat("{} failed: {}", query, result->getErrorMessage());
+    }
+    return "";
+}
+
+static std::string runAgentMemoryWriter(uint64_t agentID, uint64_t sessionsPerAgent,
+    uint64_t messagesPerSession, uint64_t entityCount, kuzu::main::Database& database) {
+    auto conn = kuzu::main::Connection(&database);
+    for (auto sessionIdx = 0u; sessionIdx < sessionsPerAgent; ++sessionIdx) {
+        const auto sessionID = agentID * 100000 + sessionIdx;
+        auto error = executeAgentMemoryQuery(conn, "BEGIN TRANSACTION;");
+        if (!error.empty()) {
+            return error;
+        }
+        error = executeAgentMemoryQuery(conn,
+            stringFormat("CREATE (:memory_session {id: {}, agentID: {}, startedAt: {}});",
+                sessionID, agentID, sessionID));
+        if (!error.empty()) {
+            return error;
+        }
+        error = executeAgentMemoryQuery(conn,
+            stringFormat("MATCH (a:agent), (s:memory_session) WHERE a.id = {} AND s.id = {} "
+                         "CREATE (a)-[:agent_has_session]->(s);",
+                agentID, sessionID));
+        if (!error.empty()) {
+            return error;
+        }
+        for (auto messageIdx = 0u; messageIdx < messagesPerSession; ++messageIdx) {
+            const auto messageID = sessionID * 10 + messageIdx;
+            const auto entityID = (agentID * 17 + sessionIdx * 7 + messageIdx) % entityCount;
+            error = executeAgentMemoryQuery(conn,
+                stringFormat("CREATE (:message {id: {}, sessionID: {}, role: 'assistant', "
+                             "content: 'agent{}_session{}_message{}'});",
+                    messageID, sessionID, agentID, sessionIdx, messageIdx));
+            if (!error.empty()) {
+                return error;
+            }
+            error = executeAgentMemoryQuery(conn,
+                stringFormat("CREATE (:fact {id: {}, entityID: {}, confidence: 0.9, "
+                             "body: 'fact_{}_{}_{}'});",
+                    messageID, entityID, agentID, sessionIdx, messageIdx));
+            if (!error.empty()) {
+                return error;
+            }
+            error = executeAgentMemoryQuery(conn,
+                stringFormat("MATCH (s:memory_session), (m:message) WHERE s.id = {} AND m.id = {} "
+                             "CREATE (s)-[:session_has_message]->(m);",
+                    sessionID, messageID));
+            if (!error.empty()) {
+                return error;
+            }
+            error = executeAgentMemoryQuery(conn,
+                stringFormat("MATCH (m:message), (e:entity) WHERE m.id = {} AND e.id = {} "
+                             "CREATE (m)-[:message_mentions_entity]->(e);",
+                    messageID, entityID));
+            if (!error.empty()) {
+                return error;
+            }
+            error = executeAgentMemoryQuery(conn,
+                stringFormat("MATCH (f:fact), (m:message) WHERE f.id = {} AND m.id = {} "
+                             "CREATE (f)-[:fact_supported_by_message]->(m);",
+                    messageID, messageID));
+            if (!error.empty()) {
+                return error;
+            }
+        }
+        error = executeAgentMemoryQuery(conn, "COMMIT;");
+        if (!error.empty()) {
+            return error;
+        }
+    }
+    return "";
+}
+
+static std::string runAgentMemoryReader(std::atomic<bool>& stopReaders,
+    kuzu::main::Database& database) {
+    auto conn = kuzu::main::Connection(&database);
+    while (!stopReaders.load()) {
+        for (auto query :
+            {"MATCH (s:memory_session)-[:session_has_message]->(m:message) RETURN COUNT(m);",
+                "MATCH (m:message)-[:message_mentions_entity]->(e:entity) RETURN COUNT(e);",
+                "MATCH (f:fact)-[:fact_supported_by_message]->(m:message) RETURN COUNT(f);"}) {
+            auto error = executeAgentMemoryQuery(conn, query);
+            if (!error.empty()) {
+                return error;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return "";
+}
+
+static void assertCount(kuzu::main::Connection& conn, const std::string& query, int64_t expected) {
+    auto result = conn.query(query);
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), expected) << query;
+}
+
+static void assertAgentMemoryEndpointInvariants(kuzu::main::Connection& conn) {
+    assertCount(conn,
+        "MATCH (a:agent)-[:agent_has_session]->(s:memory_session) "
+        "WHERE s.agentID <> a.id RETURN COUNT(s);",
+        0);
+    assertCount(conn,
+        "MATCH (s:memory_session)-[:session_has_message]->(m:message) "
+        "WHERE m.sessionID <> s.id RETURN COUNT(m);",
+        0);
+    assertCount(conn,
+        "MATCH (m:message)-[:message_mentions_entity]->(e:entity), (f:fact) "
+        "WHERE f.id = m.id AND f.entityID <> e.id RETURN COUNT(m);",
+        0);
+    assertCount(conn,
+        "MATCH (f:fact)-[:fact_supported_by_message]->(m:message) "
+        "WHERE f.id <> m.id RETURN COUNT(f);",
+        0);
+}
+
+static void assertAgentMemoryState(kuzu::main::Connection& conn, int64_t numAgents,
+    int64_t entityCount, int64_t expectedSessions, int64_t expectedMessages) {
+    assertCount(conn, "MATCH (a:agent) RETURN COUNT(a);", numAgents);
+    assertCount(conn, "MATCH (s:memory_session) RETURN COUNT(s);", expectedSessions);
+    assertCount(conn, "MATCH (m:message) RETURN COUNT(m);", expectedMessages);
+    assertCount(conn, "MATCH (f:fact) RETURN COUNT(f);", expectedMessages);
+    assertCount(conn, "MATCH (e:entity) RETURN COUNT(e);", entityCount);
+    assertCount(conn, "MATCH (:agent)-[r:agent_has_session]->(:memory_session) RETURN COUNT(r);",
+        expectedSessions);
+    assertCount(conn,
+        "MATCH (:memory_session)-[r:session_has_message]->(:message) RETURN COUNT(r);",
+        expectedMessages);
+    assertCount(conn, "MATCH (:message)-[r:message_mentions_entity]->(:entity) RETURN COUNT(r);",
+        expectedMessages);
+    assertCount(conn, "MATCH (:fact)-[r:fact_supported_by_message]->(:message) RETURN COUNT(r);",
+        expectedMessages);
+    assertCount(conn,
+        "MATCH (a:agent)-[:agent_has_session]->(s:memory_session) "
+        "RETURN COUNT(DISTINCT s.id);",
+        expectedSessions);
+    assertCount(conn,
+        "MATCH (s:memory_session)-[:session_has_message]->(m:message) "
+        "RETURN COUNT(DISTINCT m.id);",
+        expectedMessages);
+    assertCount(conn,
+        "MATCH (a:agent)-[:agent_has_session]->(s:memory_session)-[:session_has_message]->"
+        "(m:message) RETURN COUNT(DISTINCT m.id);",
+        expectedMessages);
+    assertAgentMemoryEndpointInvariants(conn);
+}
+
+TEST_F(EmptyDBTransactionTest, ConcurrentWritesDefaultAcrossCheckpointAndReload) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto res = conn->query("CALL current_setting('concurrent_writes') RETURN *;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    ASSERT_EQ(res->getNext()->getValue(0)->getValue<std::string>(), "True");
+
+    res = conn->query("CALL auto_checkpoint=false;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    res = conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+
+    auto numThreads = 3;
+    auto numInsertsPerThread = 200;
+    std::vector<std::thread> threads;
+    for (auto i = 0; i < numThreads; ++i) {
+        threads.emplace_back(insertNodes, i * numInsertsPerThread, numInsertsPerThread,
+            std::ref(*database));
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    res = conn->query("CHECKPOINT;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+
+    res.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+
+    auto numTotalInsertions = numThreads * numInsertsPerThread;
+    res = conn->query("MATCH (a:test) RETURN COUNT(a) AS COUNT;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    ASSERT_EQ(res->getNext()->getValue(0)->getValue<int64_t>(), numTotalInsertions);
+    res = conn->query("MATCH (a:test) RETURN SUM(a.id) AS SUM_ID;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    ASSERT_EQ(res->getNext()->getValue(0)->getValue<int128_t>(),
+        (numTotalInsertions * (numTotalInsertions - 1)) / 2);
+}
+
+TEST_F(EmptyDBTransactionTest, DefaultConcurrentAgentMemoryUnderAutoCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto result = conn->query("CALL current_setting('concurrent_writes') RETURN *;");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<std::string>(), "True");
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=true;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL checkpoint_threshold=16384;")->isSuccess());
+
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE agent(id INT64 PRIMARY KEY, name STRING);")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE memory_session(id INT64 PRIMARY KEY, agentID INT64, "
+                    "startedAt INT64);")
+            ->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE message(id INT64 PRIMARY KEY, sessionID INT64, "
+                    "role STRING, content STRING);")
+            ->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE entity(id INT64 PRIMARY KEY, name STRING);")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE fact(id INT64 PRIMARY KEY, entityID INT64, "
+                    "confidence DOUBLE, body STRING);")
+            ->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE REL TABLE agent_has_session(FROM agent TO memory_session, "
+                    "MANY_MANY);")
+            ->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE REL TABLE session_has_message(FROM memory_session TO message, "
+                    "MANY_MANY);")
+            ->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE REL TABLE message_mentions_entity(FROM message TO entity, "
+                    "MANY_MANY);")
+            ->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE REL TABLE fact_supported_by_message(FROM fact TO message, "
+                    "MANY_MANY);")
+            ->isSuccess());
+
+    constexpr auto numAgents = 4u;
+    constexpr auto entityCount = 16u;
+    constexpr auto sessionsPerAgent = 8u;
+    constexpr auto messagesPerSession = 3u;
+    const auto expectedSessions = numAgents * sessionsPerAgent;
+    const auto expectedMessages = expectedSessions * messagesPerSession;
+    ASSERT_TRUE(conn->query("BEGIN TRANSACTION;")->isSuccess());
+    for (auto agentID = 0u; agentID < numAgents; ++agentID) {
+        result = conn->query(
+            stringFormat("CREATE (:agent {id: {}, name: 'agent_{}'});", agentID, agentID));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    for (auto entityID = 0u; entityID < entityCount; ++entityID) {
+        result = conn->query(
+            stringFormat("CREATE (:entity {id: {}, name: 'entity_{}'});", entityID, entityID));
+        ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    }
+    ASSERT_TRUE(conn->query("COMMIT;")->isSuccess());
+
+    std::atomic<bool> stopReaders{false};
+    std::vector<std::future<std::string>> readerFutures;
+    for (auto i = 0; i < 1; ++i) {
+        readerFutures.push_back(std::async(std::launch::async,
+            [&]() { return runAgentMemoryReader(stopReaders, *database); }));
+    }
+    std::vector<std::future<std::string>> writerFutures;
+    for (auto agentID = 0u; agentID < numAgents; ++agentID) {
+        writerFutures.push_back(std::async(std::launch::async, [&, agentID]() {
+            return runAgentMemoryWriter(agentID, sessionsPerAgent, messagesPerSession, entityCount,
+                *database);
+        }));
+    }
+
+    std::string firstError;
+    for (auto& writerFuture : writerFutures) {
+        auto error = writerFuture.get();
+        if (!error.empty() && firstError.empty()) {
+            firstError = error;
+        }
+    }
+    stopReaders.store(true);
+    for (auto& readerFuture : readerFutures) {
+        auto error = readerFuture.get();
+        if (!error.empty() && firstError.empty()) {
+            firstError = error;
+        }
+    }
+    ASSERT_TRUE(firstError.empty()) << firstError;
+
+    assertAgentMemoryState(*conn, numAgents, entityCount, expectedSessions, expectedMessages);
+
+    result = conn->query("CALL force_checkpoint_on_close=false;");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    result.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+    assertAgentMemoryState(*conn, numAgents, entityCount, expectedSessions, expectedMessages);
+
+    result = conn->query("CHECKPOINT;");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    result.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+
+    assertAgentMemoryState(*conn, numAgents, entityCount, expectedSessions, expectedMessages);
 }
 
 TEST_F(EmptyDBTransactionTest, ConcurrentNodeInsertions) {
