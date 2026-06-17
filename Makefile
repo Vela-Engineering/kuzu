@@ -6,6 +6,7 @@
 .PHONY: \
 	release relwithdebinfo debug all allconfig alldebug \
 	test-build test lcov \
+	dotnet dotnettest \
 	java_native_header java javatest \
 	nodejs nodejstest \
 	python python-debug pytest pytest-debug \
@@ -17,7 +18,7 @@
 	shell-test \
 	tidy tidy-analyzer clangd-diagnostics \
 	install \
-	clean-extension clean-python-api clean-java clean
+	clean-extension clean-python-api clean-java clean-dotnet clean
 .ONESHELL:
 .SHELLFLAGS = -ec
 
@@ -127,6 +128,7 @@ debug:
 allconfig:
 	$(call config-cmake-release, \
 		-DBUILD_BENCHMARK=TRUE \
+		-DBUILD_DOTNET=TRUE \
 		-DBUILD_EXAMPLES=TRUE \
 		-DBUILD_EXTENSIONS="$(EXTENSION_LIST)" \
 		-DBUILD_JAVA=TRUE \
@@ -163,6 +165,12 @@ lcov:
 	ctest --test-dir build/$(call get-build-path,Release)/test --output-on-failure -j ${TEST_JOBS}
 
 # Language APIs
+
+dotnet:
+	$(call run-cmake-release, -DBUILD_DOTNET=TRUE)
+
+dotnettest: dotnet
+	cd tools/dotnet_api/src && dotnet test Kuzu.Net.Tests/Kuzu.Net.Tests.csproj -c Release --no-build
 
 # Required for clangd-related tools.
 java_native_header:
@@ -335,7 +343,11 @@ clean-python-api:
 clean-java:
 	cmake -E rm -rf tools/java_api/build
 
-clean: clean-extension clean-python-api clean-java
+clean-dotnet:
+	cmake -E rm -rf tools/dotnet_api/src/Kuzu.Net/bin tools/dotnet_api/src/Kuzu.Net/obj
+	cmake -E rm -rf tools/dotnet_api/src/Kuzu.Net.Tests/bin tools/dotnet_api/src/Kuzu.Net.Tests/obj
+
+clean: clean-extension clean-python-api clean-java clean-dotnet
 	cmake -E rm -rf build
 
 

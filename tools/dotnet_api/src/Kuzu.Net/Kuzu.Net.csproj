@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <RootNamespace>KuzuDB</RootNamespace>
+    <AssemblyName>KuzuDB</AssemblyName>
+    <LangVersion>latest</LangVersion>
+
+    <!-- NuGet package metadata -->
+    <PackageId>Kuzu.Net</PackageId>
+    <Version>0.12.0</Version>
+    <Authors>Kuzudb</Authors>
+    <Description>Official .NET bindings for KuzuDB — an embeddable property graph database.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/kuzudb/kuzu</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/kuzudb/kuzu</RepositoryUrl>
+    <PackageTags>kuzu;kuzudb;graph;database;property-graph;embedded</PackageTags>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+  </PropertyGroup>
+
+  <!-- Native libraries per RID — packed into NuGet and copied to output -->
+  <ItemGroup Condition="Exists('runtimes')">
+    <None Include="runtimes/**/*" Pack="true" PackagePath="runtimes" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Include the .targets file so consuming projects auto-copy native libs -->
+  <ItemGroup>
+    <None Include="Kuzu.Net.targets" Pack="true" PackagePath="build" />
+  </ItemGroup>
+
+  <!-- Import our own targets to handle native lib resolution for this project too -->
+  <Import Project="Kuzu.Net.targets" Condition="Exists('Kuzu.Net.targets')" />
+</Project>

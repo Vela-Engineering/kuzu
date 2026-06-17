@@ -293,6 +293,7 @@ option(AUTO_UPDATE_GRAMMAR "Automatically regenerate C++ grammar files on change
 option(BUILD_BENCHMARK "Build benchmarks." FALSE)
 option(BUILD_EXTENSIONS "Semicolon-separated list of extensions to build." "")
 option(BUILD_EXAMPLES "Build examples." FALSE)
+option(BUILD_DOTNET "Build .NET API (SWIG-based C# bindings)." FALSE)
 option(BUILD_JAVA "Build Java API." FALSE)
 option(BUILD_NODEJS "Build NodeJS API." FALSE)
 option(BUILD_PYTHON "Build Python API." FALSE)

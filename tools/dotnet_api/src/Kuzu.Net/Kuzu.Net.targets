@@ -1,0 +1,28 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Copy the correct native libraries from runtimes/{RID}/native/ to the
+    consuming project's output directory.
+
+    Works for both NuGet package consumers and ProjectReference consumers.
+    The RID is determined from RuntimeIdentifier, or auto-detected from the
+    current OS if not set.
+  -->
+  <PropertyGroup>
+    <_KuzuNetRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_KuzuNetRid>
+    <_KuzuNetRid Condition="'$(_KuzuNetRid)' == '' AND $([MSBuild]::IsOSPlatform('OSX')) AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">osx-arm64</_KuzuNetRid>
+    <_KuzuNetRid Condition="'$(_KuzuNetRid)' == '' AND $([MSBuild]::IsOSPlatform('OSX'))">osx-x64</_KuzuNetRid>
+    <_KuzuNetRid Condition="'$(_KuzuNetRid)' == '' AND $([MSBuild]::IsOSPlatform('Linux')) AND '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'Arm64'">linux-arm64</_KuzuNetRid>
+    <_KuzuNetRid Condition="'$(_KuzuNetRid)' == '' AND $([MSBuild]::IsOSPlatform('Linux'))">linux-x64</_KuzuNetRid>
+    <_KuzuNetRid Condition="'$(_KuzuNetRid)' == '' AND $([MSBuild]::IsOSPlatform('Windows'))">win-x64</_KuzuNetRid>
+    <_KuzuNetNativeDir>$(MSBuildThisFileDirectory)runtimes/$(_KuzuNetRid)/native/</_KuzuNetNativeDir>
+  </PropertyGroup>
+
+  <!-- Use Content items so they propagate through ProjectReference -->
+  <ItemGroup Condition="Exists('$(_KuzuNetNativeDir)')">
+    <Content Include="$(_KuzuNetNativeDir)**"
+             CopyToOutputDirectory="PreserveNewest"
+             Link="%(Filename)%(Extension)"
+             Visible="false"
+             Pack="false" />
+  </ItemGroup>
+</Project>
