@@ -110,6 +110,7 @@ private:
     bool autoCheckpointRequested = false;
     bool stopAutoCheckpointWorker = false;
     std::string lastAutoCheckpointErrorMessage;
+    bool checkpointRecoveryRequired = false;
 
     std::mutex mtxForInitCheckpointerFunc;
     init_checkpointer_func_t initCheckpointerFunc;

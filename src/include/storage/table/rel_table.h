@@ -207,10 +207,7 @@ public:
     RelTableData* getDirectedTableData(common::RelDataDirection direction) const;
 
     common::offset_t reserveRelOffsets(common::offset_t numRels) {
-        std::unique_lock xLck{relOffsetMtx};
-        const auto currentRelOffset = nextRelOffset;
-        nextRelOffset += numRels;
-        return currentRelOffset;
+        return nextRelOffset.fetch_add(numRels, std::memory_order_relaxed);
     }
 
     void pushInsertInfo(const transaction::Transaction* transaction,
@@ -243,8 +240,7 @@ private:
     common::table_id_t relGroupID;
     common::table_id_t fromNodeTableID;
     common::table_id_t toNodeTableID;
-    std::mutex relOffsetMtx;
-    common::offset_t nextRelOffset;
+    std::atomic<common::offset_t> nextRelOffset;
     std::vector<std::unique_ptr<RelTableData>> directedRelData;
 };
 

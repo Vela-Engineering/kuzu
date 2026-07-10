@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 
+#include "common/cast.h"
 #include "common/uniq_lock.h"
 #include "storage/enums/residency_state.h"
 #include "storage/table/chunked_node_group.h"
@@ -66,6 +67,31 @@ struct NodeGroupCheckpointState {
     T& cast() {
         return common::ku_dynamic_cast<T&>(*this);
     }
+};
+
+struct PreparedNodeGroupCheckpointBase {
+    PreparedNodeGroupCheckpointBase() = default;
+    PreparedNodeGroupCheckpointBase(const PreparedNodeGroupCheckpointBase&) = delete;
+    PreparedNodeGroupCheckpointBase& operator=(const PreparedNodeGroupCheckpointBase&) = delete;
+    PreparedNodeGroupCheckpointBase(PreparedNodeGroupCheckpointBase&&) = default;
+    PreparedNodeGroupCheckpointBase& operator=(PreparedNodeGroupCheckpointBase&&) = default;
+    virtual ~PreparedNodeGroupCheckpointBase() = default;
+
+    template<class TARGET>
+    TARGET& cast() {
+        return common::ku_dynamic_cast<TARGET&>(*this);
+    }
+};
+
+struct PreparedNodeGroupCheckpoint final : PreparedNodeGroupCheckpointBase {
+    PreparedNodeGroupCheckpoint() = default;
+    PreparedNodeGroupCheckpoint(std::unique_ptr<ChunkedNodeGroup> checkpointedChunkedGroup,
+        std::vector<common::LogicalType> checkpointedDataTypes)
+        : checkpointedChunkedGroup{std::move(checkpointedChunkedGroup)},
+          checkpointedDataTypes{std::move(checkpointedDataTypes)} {}
+
+    std::unique_ptr<ChunkedNodeGroup> checkpointedChunkedGroup;
+    std::vector<common::LogicalType> checkpointedDataTypes;
 };
 
 struct NodeGroupScanResult {
@@ -176,6 +202,10 @@ public:
     void reclaimStorage(PageAllocator& pageAllocator) const;
     virtual void reclaimStorage(PageAllocator& pageAllocator, const common::UniqLock& lock) const;
 
+    virtual std::unique_ptr<PreparedNodeGroupCheckpointBase> prepareCheckpoint(
+        MemoryManager& memoryManager, NodeGroupCheckpointState& state);
+    virtual void installCheckpoint(std::unique_ptr<PreparedNodeGroupCheckpointBase> checkpoint,
+        PageAllocator& pageAllocator);
     virtual void checkpoint(MemoryManager& memoryManager, NodeGroupCheckpointState& state);
 
     uint64_t getEstimatedMemoryUsage() const;
@@ -226,6 +256,13 @@ private:
     ChunkedNodeGroup* findChunkedGroupFromRowIdx(const common::UniqLock& lock,
         common::row_idx_t rowIdx) const;
     ChunkedNodeGroup* findChunkedGroupFromRowIdxNoLock(common::row_idx_t rowIdx) const;
+
+    PreparedNodeGroupCheckpoint prepareCheckpointNoLock(MemoryManager& memoryManager,
+        const common::UniqLock& lock, NodeGroupCheckpointState& state) const;
+    void installCheckpointNoLock(const common::UniqLock& lock,
+        PreparedNodeGroupCheckpoint checkpoint, PageAllocator& pageAllocator);
+    std::vector<common::LogicalType> getCheckpointDataTypesNoLock(
+        const NodeGroupCheckpointState& state) const;
 
     std::unique_ptr<ChunkedNodeGroup> checkpointInMemOnly(MemoryManager& memoryManager,
         const common::UniqLock& lock, const NodeGroupCheckpointState& state) const;

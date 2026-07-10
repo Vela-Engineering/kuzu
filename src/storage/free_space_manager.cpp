@@ -1,5 +1,8 @@
 #include "storage/free_space_manager.h"
 
+#include <algorithm>
+
+#include "common/exception/runtime.h"
 #include "common/serializer/deserializer.h"
 #include "common/serializer/in_mem_file_writer.h"
 #include "common/serializer/serializer.h"
@@ -32,9 +35,15 @@ bool FreeSpaceManager::entryCmp(const PageRange& a, const PageRange& b) {
 }
 
 void FreeSpaceManager::addFreePages(PageRange entry) {
-    KU_ASSERT(entry.numPages > 0);
+    if (entry.numPages == 0) {
+        throw common::RuntimeException("Cannot add an empty range to the free space manager.");
+    }
     const auto entryLevel = getLevel(entry.numPages);
-    KU_ASSERT(!getFreeList(freeLists, entryLevel).contains(entry));
+    if (getFreeList(freeLists, entryLevel).contains(entry)) {
+        throw common::RuntimeException(common::stringFormat(
+            "Duplicate free page range [{}, {}).", entry.startPageIdx,
+            entry.startPageIdx + entry.numPages));
+    }
     getFreeList(freeLists, entryLevel).insert(entry);
     ++numEntries;
 }
@@ -46,6 +55,104 @@ void FreeSpaceManager::evictAndAddFreePages(FileHandle* fileHandle, PageRange en
 
 void FreeSpaceManager::addUncheckpointedFreePages(PageRange entry) {
     uncheckpointedFreePageRanges.push_back(entry);
+}
+
+static bool isValidPageRange(const PageRange& entry) {
+    return entry.startPageIdx != common::INVALID_PAGE_IDX && entry.numPages > 0;
+}
+
+static common::page_idx_t getEndPageIdx(const PageRange& entry) {
+    return entry.startPageIdx + entry.numPages;
+}
+
+static bool overlaps(const PageRange& a, const PageRange& b) {
+    return isValidPageRange(a) && isValidPageRange(b) && a.startPageIdx < getEndPageIdx(b) &&
+           b.startPageIdx < getEndPageIdx(a);
+}
+
+static bool areSamePageRange(const PageRange& a, const PageRange& b) {
+    return a.startPageIdx == b.startPageIdx && a.numPages == b.numPages;
+}
+
+static FreeSpaceManager::free_list_t subtractPageRange(PageRange entry,
+    const PageRange& rangeToExclude) {
+    if (!overlaps(entry, rangeToExclude)) {
+        return {entry};
+    }
+    FreeSpaceManager::free_list_t ret;
+    const auto entryEnd = getEndPageIdx(entry);
+    const auto excludeEnd = getEndPageIdx(rangeToExclude);
+    if (entry.startPageIdx < rangeToExclude.startPageIdx) {
+        ret.emplace_back(entry.startPageIdx, rangeToExclude.startPageIdx - entry.startPageIdx);
+    }
+    if (excludeEnd < entryEnd) {
+        ret.emplace_back(excludeEnd, entryEnd - excludeEnd);
+    }
+    return ret;
+}
+
+static FreeSpaceManager::free_list_t subtractPageRanges(PageRange entry,
+    const std::vector<PageRange>& rangesToExclude) {
+    if (!isValidPageRange(entry)) {
+        return {};
+    }
+    FreeSpaceManager::free_list_t remainingRanges{entry};
+    for (const auto& rangeToExclude : rangesToExclude) {
+        FreeSpaceManager::free_list_t nextRemainingRanges;
+        for (const auto& remainingRange : remainingRanges) {
+            auto subtractedRanges = subtractPageRange(remainingRange, rangeToExclude);
+            nextRemainingRanges.insert(nextRemainingRanges.end(), subtractedRanges.begin(),
+                subtractedRanges.end());
+        }
+        remainingRanges = std::move(nextRemainingRanges);
+        if (remainingRanges.empty()) {
+            break;
+        }
+    }
+    return remainingRanges;
+}
+
+bool FreeSpaceManager::addUncheckpointedFreePages(PageRange entry,
+    const std::vector<PageRange>& rangesToExclude) {
+    auto remainingRanges = subtractPageRanges(entry, rangesToExclude);
+    uncheckpointedFreePageRanges.insert(uncheckpointedFreePageRanges.end(), remainingRanges.begin(),
+        remainingRanges.end());
+    return !remainingRanges.empty();
+}
+
+bool FreeSpaceManager::removeFreePages(PageRange entry) {
+    if (!isValidPageRange(entry)) {
+        return false;
+    }
+    bool removedAnyPages = false;
+    free_list_t remainingCheckpointedRanges;
+    auto entryIt = FreeEntryIterator{freeLists};
+    while (!entryIt.done()) {
+        const auto freeEntry = *entryIt;
+        auto remainingRanges = subtractPageRange(freeEntry, entry);
+        removedAnyPages = removedAnyPages || remainingRanges.size() != 1 ||
+                          !areSamePageRange(remainingRanges[0], freeEntry);
+        remainingCheckpointedRanges.insert(remainingCheckpointedRanges.end(),
+            remainingRanges.begin(), remainingRanges.end());
+        ++entryIt;
+    }
+    if (removedAnyPages) {
+        resetFreeLists();
+        for (const auto& remainingRange : remainingCheckpointedRanges) {
+            addFreePages(remainingRange);
+        }
+    }
+
+    free_list_t remainingUncheckpointedRanges;
+    for (const auto& freeEntry : uncheckpointedFreePageRanges) {
+        auto remainingRanges = subtractPageRange(freeEntry, entry);
+        removedAnyPages = removedAnyPages || remainingRanges.size() != 1 ||
+                          !areSamePageRange(remainingRanges[0], freeEntry);
+        remainingUncheckpointedRanges.insert(remainingUncheckpointedRanges.end(),
+            remainingRanges.begin(), remainingRanges.end());
+    }
+    uncheckpointedFreePageRanges = std::move(remainingUncheckpointedRanges);
+    return removedAnyPages;
 }
 
 void FreeSpaceManager::rollbackCheckpoint() {
@@ -71,7 +178,11 @@ std::optional<PageRange> FreeSpaceManager::popFreePages(common::page_idx_t numPa
 }
 
 PageRange FreeSpaceManager::splitPageRange(PageRange chunk, common::page_idx_t numRequiredPages) {
-    KU_ASSERT(chunk.numPages >= numRequiredPages);
+    if (chunk.numPages < numRequiredPages) {
+        throw common::RuntimeException(common::stringFormat(
+            "Cannot allocate {} pages from a free range containing {} pages.", numRequiredPages,
+            chunk.numPages));
+    }
     PageRange ret{chunk.startPageIdx, numRequiredPages};
     if (numRequiredPages < chunk.numPages) {
         PageRange remainingEntry{chunk.startPageIdx + numRequiredPages,
@@ -166,7 +277,8 @@ void FreeSpaceManager::serialize(common::Serializer& ser) const {
     serializeInternal(serWrapper);
 }
 
-void FreeSpaceManager::deserialize(common::Deserializer& deSer) {
+bool FreeSpaceManager::deserialize(common::Deserializer& deSer, common::page_idx_t maxNumPages,
+    const std::vector<PageRange>& rangesToExclude) {
     std::string key;
 
     deSer.validateDebuggingInfo(key, "page_manager");
@@ -175,12 +287,49 @@ void FreeSpaceManager::deserialize(common::Deserializer& deSer) {
     deSer.deserializeValue<common::row_idx_t>(numEntries);
 
     deSer.validateDebuggingInfo(key, "entries");
+    free_list_t sanitizedEntries;
+    bool repaired = false;
     for (common::row_idx_t i = 0; i < numEntries; ++i) {
         PageRange entry{};
         deSer.deserializeValue<common::page_idx_t>(entry.startPageIdx);
         deSer.deserializeValue<common::page_idx_t>(entry.numPages);
+        if (!isValidPageRange(entry) || entry.startPageIdx >= maxNumPages) {
+            repaired = true;
+            continue;
+        }
+        const auto maxRangePages = maxNumPages - entry.startPageIdx;
+        if (entry.numPages > maxRangePages) {
+            entry.numPages = maxRangePages;
+            repaired = true;
+        }
+        auto remainingRanges = subtractPageRanges(entry, rangesToExclude);
+        if (remainingRanges.size() != 1 || !areSamePageRange(remainingRanges[0], entry)) {
+            repaired = true;
+        }
+        sanitizedEntries.insert(sanitizedEntries.end(), remainingRanges.begin(),
+            remainingRanges.end());
+    }
+    std::sort(sanitizedEntries.begin(), sanitizedEntries.end(),
+        [](const auto& a, const auto& b) { return a.startPageIdx < b.startPageIdx; });
+    free_list_t mergedEntries;
+    for (const auto& entry : sanitizedEntries) {
+        if (mergedEntries.empty() || getEndPageIdx(mergedEntries.back()) < entry.startPageIdx) {
+            mergedEntries.push_back(entry);
+            continue;
+        }
+        const auto mergedEnd = getEndPageIdx(mergedEntries.back());
+        const auto entryEnd = getEndPageIdx(entry);
+        if (mergedEnd > entry.startPageIdx) {
+            repaired = true;
+        }
+        mergedEntries.back().numPages = std::max(mergedEnd, entryEnd) -
+                                        mergedEntries.back().startPageIdx;
+    }
+    resetFreeLists();
+    for (const auto& entry : mergedEntries) {
         addFreePages(entry);
     }
+    return repaired;
 }
 
 void FreeSpaceManager::evictPages(FileHandle* fileHandle, const PageRange& entry) {
@@ -223,8 +372,13 @@ void FreeSpaceManager::mergePageRanges(free_list_t newInitialEntries, FileHandle
     PageRange prevEntry = allEntries[0];
     for (common::row_idx_t i = 1; i < allEntries.size(); ++i) {
         const auto& entry = allEntries[i];
-        KU_ASSERT(prevEntry.startPageIdx + prevEntry.numPages <= entry.startPageIdx);
-        if (prevEntry.startPageIdx + prevEntry.numPages == entry.startPageIdx) {
+        const auto previousEnd = prevEntry.startPageIdx + prevEntry.numPages;
+        if (previousEnd > entry.startPageIdx) {
+            throw common::RuntimeException(common::stringFormat(
+                "Overlapping free page ranges [{}, {}) and [{}, {}).", prevEntry.startPageIdx,
+                previousEnd, entry.startPageIdx, entry.startPageIdx + entry.numPages));
+        }
+        if (previousEnd == entry.startPageIdx) {
             prevEntry.numPages += entry.numPages;
         } else {
             addFreePages(prevEntry);
@@ -235,11 +389,8 @@ void FreeSpaceManager::mergePageRanges(free_list_t newInitialEntries, FileHandle
 }
 
 void FreeSpaceManager::handleLastPageRange(PageRange pageRange, FileHandle* fileHandle) {
-    if (pageRange.startPageIdx + pageRange.numPages == fileHandle->getNumPages()) {
-        fileHandle->removePageIdxAndTruncateIfNecessary(pageRange.startPageIdx);
-    } else {
-        addFreePages(pageRange);
-    }
+    KU_UNUSED(fileHandle);
+    addFreePages(pageRange);
 }
 
 common::row_idx_t FreeSpaceManager::getNumEntries() const {

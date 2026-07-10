@@ -40,13 +40,14 @@ public:
         return (((oldStateAndVersion << 8) >> 8) + 1) | (newState << NUM_BITS_TO_SHIFT_FOR_STATE);
     }
     void spinLock(uint64_t oldStateAndVersion) {
-        while (true) {
-            if (tryLock(oldStateAndVersion)) {
-                return;
-            }
+        while (!tryLock(oldStateAndVersion)) {
+            oldStateAndVersion = stateAndVersion.load();
         }
     }
     bool tryLock(uint64_t oldStateAndVersion) {
+        if (getState(oldStateAndVersion) == LOCKED) {
+            return false;
+        }
         return stateAndVersion.compare_exchange_strong(oldStateAndVersion,
             updateStateWithSameVersion(oldStateAndVersion, LOCKED));
     }

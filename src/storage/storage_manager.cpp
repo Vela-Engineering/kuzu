@@ -44,9 +44,7 @@ void StorageManager::initDataFileHandle(VirtualFileSystem* vfs, main::ClientCont
     } else {
         auto flag = readOnly ? FileHandle::O_PERSISTENT_FILE_READ_ONLY :
                                FileHandle::O_PERSISTENT_FILE_CREATE_NOT_EXISTS;
-        if (!readOnly) {
-            flag |= FileHandle::O_LOCKED_PERSISTENT_FILE;
-        }
+        flag |= FileHandle::O_LOCKED_PERSISTENT_FILE;
         dataFH = memoryManager.getBufferManager()->getFileHandle(databasePath, flag, vfs, context);
         if (dataFH->getNumPages() == 0) {
             if (!readOnly) {

@@ -65,15 +65,17 @@ CatalogEntry* CatalogSet::getEntryNoLock(const Transaction* transaction,
 oid_t CatalogSet::createEntry(Transaction* transaction, std::unique_ptr<CatalogEntry> entry) {
     CatalogEntry* entryPtr = nullptr;
     oid_t oid = INVALID_OID;
+    bool internal = false;
     {
         std::unique_lock lck{mtx};
         oid = nextOID++;
+        internal = isInternal();
         entry->setOID(oid);
         entryPtr = createEntryNoLock(transaction, std::move(entry));
     }
     KU_ASSERT(entryPtr);
     if (transaction->shouldAppendToUndoBuffer()) {
-        transaction->pushCreateDropCatalogEntry(*this, *entryPtr, isInternal());
+        transaction->pushCreateDropCatalogEntry(*this, *entryPtr, internal);
     }
     return oid;
 }
@@ -146,13 +148,15 @@ CatalogEntry* CatalogSet::getCommittedEntryNoLock(CatalogEntry* entry) {
 
 void CatalogSet::dropEntry(Transaction* transaction, const std::string& name, oid_t oid) {
     CatalogEntry* entryPtr = nullptr;
+    bool internal = false;
     {
         std::unique_lock lck{mtx};
+        internal = isInternal();
         entryPtr = dropEntryNoLock(transaction, name, oid);
     }
     KU_ASSERT(entryPtr);
     if (transaction->shouldAppendToUndoBuffer()) {
-        transaction->pushCreateDropCatalogEntry(*this, *entryPtr, isInternal());
+        transaction->pushCreateDropCatalogEntry(*this, *entryPtr, internal);
     }
 }
 
@@ -161,6 +165,10 @@ CatalogEntry* CatalogSet::dropEntryNoLock(const Transaction* transaction, const 
     // LCOV_EXCL_START
     validateExistNoLock(transaction, name);
     // LCOV_EXCL_STOP
+    if (checkWWConflict(transaction, entries.at(name).get())) {
+        throw CatalogException(stringFormat(
+            "Write-write conflict on dropping catalog entry with name {}.", name));
+    }
     auto tombstone = createDummyEntryNoLock(name, oid);
     tombstone->setTimestamp(transaction->getID());
     const auto tombstonePtr = tombstone.get();
@@ -174,6 +182,10 @@ void CatalogSet::alterTableEntry(Transaction* transaction,
     // LCOV_EXCL_START
     validateExistNoLock(transaction, alterInfo.tableName);
     // LCOV_EXCL_STOP
+    if (checkWWConflict(transaction, entries.at(alterInfo.tableName).get())) {
+        throw CatalogException(stringFormat(
+            "Write-write conflict on altering catalog entry with name {}.", alterInfo.tableName));
+    }
     auto entry = getEntryNoLock(transaction, alterInfo.tableName);
     KU_ASSERT(entry->getType() == CatalogEntryType::NODE_TABLE_ENTRY ||
               entry->getType() == CatalogEntryType::REL_GROUP_ENTRY);
@@ -181,6 +193,13 @@ void CatalogSet::alterTableEntry(Transaction* transaction,
     auto newEntry = tableEntry->alter(transaction->getID(), alterInfo, this);
     switch (alterInfo.alterType) {
     case AlterType::RENAME: {
+        const auto& newName =
+            alterInfo.extraInfo->constCast<binder::BoundExtraRenameTableInfo>().newName;
+        validateNotExistNoLock(transaction, newName);
+        if (entries.contains(newName) && checkWWConflict(transaction, entries.at(newName).get())) {
+            throw CatalogException(stringFormat(
+                "Write-write conflict on creating catalog entry with name {}.", newName));
+        }
         // We treat rename table as drop and create.
         dropEntryNoLock(transaction, alterInfo.tableName, entry->getOID());
         auto createdEntry = createEntryNoLock(transaction, std::move(newEntry));

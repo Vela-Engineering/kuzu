@@ -198,19 +198,38 @@ uint64_t NodeGroupCollection::getEstimatedMemoryUsage() const {
     return estimatedMemUsage;
 }
 
+PreparedNodeGroupCollectionCheckpoint NodeGroupCollection::prepareCheckpoint(
+    MemoryManager& memoryManager, NodeGroupCheckpointState& state) {
+    KU_ASSERT(residency == ResidencyState::ON_DISK);
+    PreparedNodeGroupCollectionCheckpoint preparedCheckpoint;
+    const auto lock = nodeGroups.lock();
+    preparedCheckpoint.nodeGroups.reserve(nodeGroups.getNumGroups(lock));
+    for (const auto& nodeGroup : nodeGroups.getAllGroups(lock)) {
+        preparedCheckpoint.nodeGroups.push_back(nodeGroup->prepareCheckpoint(memoryManager, state));
+    }
+    preparedCheckpoint.checkpointedTypes.reserve(state.columnIDs.size());
+    for (auto i = 0u; i < state.columnIDs.size(); i++) {
+        preparedCheckpoint.checkpointedTypes.push_back(types[state.columnIDs[i]].copy());
+    }
+    return preparedCheckpoint;
+}
+
+void NodeGroupCollection::installCheckpoint(PreparedNodeGroupCollectionCheckpoint checkpoint,
+    PageAllocator& pageAllocator) {
+    const auto lock = nodeGroups.lock();
+    KU_ASSERT(checkpoint.nodeGroups.size() == nodeGroups.getNumGroups(lock));
+    for (auto i = 0u; i < checkpoint.nodeGroups.size(); i++) {
+        nodeGroups.getGroup(lock, i)->installCheckpoint(std::move(checkpoint.nodeGroups[i]),
+            pageAllocator);
+    }
+    types = std::move(checkpoint.checkpointedTypes);
+}
+
 // NOLINTNEXTLINE(readability-make-member-function-const): Semantically non-const.
 void NodeGroupCollection::checkpoint(MemoryManager& memoryManager,
     NodeGroupCheckpointState& state) {
-    KU_ASSERT(residency == ResidencyState::ON_DISK);
-    const auto lock = nodeGroups.lock();
-    for (const auto& nodeGroup : nodeGroups.getAllGroups(lock)) {
-        nodeGroup->checkpoint(memoryManager, state);
-    }
-    std::vector<LogicalType> typesAfterCheckpoint;
-    for (auto i = 0u; i < state.columnIDs.size(); i++) {
-        typesAfterCheckpoint.push_back(types[state.columnIDs[i]].copy());
-    }
-    types = std::move(typesAfterCheckpoint);
+    auto preparedCheckpoint = prepareCheckpoint(memoryManager, state);
+    installCheckpoint(std::move(preparedCheckpoint), state.pageAllocator);
 }
 
 void NodeGroupCollection::reclaimStorage(PageAllocator& pageAllocator) const {

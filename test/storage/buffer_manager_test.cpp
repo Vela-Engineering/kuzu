@@ -1,6 +1,10 @@
 #include <cstdint>
 
 #include "common/constants.h"
+#include "common/serializer/buffer_reader.h"
+#include "common/serializer/buffer_writer.h"
+#include "common/serializer/deserializer.h"
+#include "common/serializer/serializer.h"
 #include "common/system_config.h"
 #include "common/types/types.h"
 #include "graph_test/private_graph_test.h"
@@ -10,6 +14,8 @@
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/buffer_manager/spiller.h"
 #include "storage/enums/residency_state.h"
+#include "storage/free_space_manager.h"
+#include "storage/page_range.h"
 #include "storage/storage_manager.h"
 #include "storage/table/chunked_node_group.h"
 #include "storage/table/column_chunk.h"
@@ -31,6 +37,42 @@ public:
         ASSERT_FALSE(bm->reserve(UINT64_MAX / 2));
     }
 };
+
+TEST(PageStateTest, TryLockRejectsLockedState) {
+    PageState state;
+    ASSERT_TRUE(state.tryLock(state.getStateAndVersion()));
+    ASSERT_FALSE(state.tryLock(state.getStateAndVersion()));
+    state.unlock();
+}
+
+TEST(FreeSpaceManagerTest, DeserializeSanitizesPersistedRanges) {
+    const auto writer = std::make_shared<BufferWriter>();
+    Serializer serializer{writer};
+    serializer.writeDebuggingInfo("page_manager");
+    serializer.writeDebuggingInfo("numEntries");
+    serializer.write<row_idx_t>(4);
+    serializer.writeDebuggingInfo("entries");
+    for (const auto& entry :
+        std::vector<PageRange>{{0, 3}, {4, 4}, {8, 5}, {20, 2}}) {
+        serializer.write<page_idx_t>(entry.startPageIdx);
+        serializer.write<page_idx_t>(entry.numPages);
+    }
+
+    Deserializer deserializer{std::make_unique<BufferReader>(
+        writer->getBlobData(), writer->getSize())};
+    FreeSpaceManager freeSpaceManager;
+    ASSERT_TRUE(freeSpaceManager.deserialize(deserializer, 10, {{0, 1}, {5, 2}}));
+    auto entries = freeSpaceManager.getEntries(0, freeSpaceManager.getNumEntries());
+    std::sort(entries.begin(), entries.end(),
+        [](const auto& a, const auto& b) { return a.startPageIdx < b.startPageIdx; });
+    ASSERT_EQ(entries.size(), 3);
+    EXPECT_EQ(entries[0].startPageIdx, 1);
+    EXPECT_EQ(entries[0].numPages, 2);
+    EXPECT_EQ(entries[1].startPageIdx, 4);
+    EXPECT_EQ(entries[1].numPages, 1);
+    EXPECT_EQ(entries[2].startPageIdx, 7);
+    EXPECT_EQ(entries[2].numPages, 3);
+}
 
 TEST_F(BufferManagerTest, TestBMUsageForIdenticalQueries) {
     auto bm = getBufferManager(*database);

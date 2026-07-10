@@ -92,6 +92,10 @@ void WAL::clearFrozenWAL() {
     vfs->removeFileIfExists(checkpointWalPath);
 }
 
+bool WAL::hasFrozenWAL() const {
+    return !inMemory && vfs->fileOrPathExists(checkpointWalPath);
+}
+
 // NOLINTNEXTLINE(readability-make-member-function-const): semantically non-const function.
 void WAL::clear() {
     std::unique_lock lck{mtx};

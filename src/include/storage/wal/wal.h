@@ -22,6 +22,7 @@ public:
     bool rotateForCheckpoint(main::ClientContext* context);
     void logAndFlushCheckpointToFrozen(main::ClientContext* context);
     void clearFrozenWAL();
+    bool hasFrozenWAL() const;
 
     // Clear any buffer in the WAL writer. Also truncate the WAL file to 0 bytes.
     void clear();

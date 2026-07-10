@@ -33,9 +33,9 @@ struct CSRRegion {
                std::any_of(hasUpdates.begin(), hasUpdates.end(),
                    [](bool hasUpdate) { return hasUpdate; });
     }
-    bool needCheckpointColumn(common::column_id_t columnID) const {
-        KU_ASSERT(columnID < hasUpdates.size());
-        return hasInsertions || hasPersistentDeletions || hasUpdates[columnID];
+    bool needCheckpointColumn(common::idx_t checkpointColumnIdx) const {
+        KU_ASSERT(checkpointColumnIdx < hasUpdates.size());
+        return hasInsertions || hasPersistentDeletions || hasUpdates[checkpointColumnIdx];
     }
     bool hasDeletionsOrInsertions() const { return hasInsertions || hasPersistentDeletions; }
     common::idx_t getLeftLeafRegionIdx() const { return regionIdx << level; }

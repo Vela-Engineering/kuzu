@@ -47,13 +47,11 @@ private:
     void removeWALAndShadowFiles() const;
     void removeFileIfExists(const std::string& path) const;
 
-    std::unique_ptr<common::FileInfo> openWALFile() const;
+    std::unique_ptr<common::FileInfo> openWALFile(const std::string& path) const;
     void syncWALFile(const common::FileInfo& fileInfo) const;
     void truncateWALFile(common::FileInfo& fileInfo, uint64_t size) const;
 
-    void replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
-        bool enableChecksums) const;
-    void replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
+    void replayWALFile(common::FileInfo& fileInfo, const WALReplayInfo& replayInfo,
         bool enableChecksums) const;
 
 private:

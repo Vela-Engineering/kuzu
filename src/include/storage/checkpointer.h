@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <vector>
 
 #include "common/types/types.h"
 #include "common/uniq_lock.h"
@@ -26,9 +27,11 @@ class AttachedKuzuDatabase;
 
 namespace storage {
 class StorageManager;
+class WALReplayer;
 
 class Checkpointer {
     friend class main::AttachedKuzuDatabase;
+    friend class WALReplayer;
     friend struct testing::FSMLeakChecker;
 
 public:
@@ -44,6 +47,7 @@ public:
     void postCheckpointCleanup();
     void rollback();
     bool wasWalRotated() const { return walRotated; }
+    bool wasShadowApplicationStarted() const { return shadowApplicationStarted; }
 
     void readCheckpoint();
 
@@ -56,22 +60,26 @@ protected:
         bool hasStorageChanges);
     virtual void writeDatabaseHeader(const DatabaseHeader& header);
     virtual void logCheckpointAndApplyShadowPages(bool walRotated);
+    void markShadowApplicationStarted() { shadowApplicationStarted = true; }
 
 private:
     static void readCheckpoint(main::ClientContext* context, catalog::Catalog* catalog,
         StorageManager* storageManager);
+    void writeRecoveryCheckpoint();
 
     PageRange serializeCatalog(const catalog::Catalog& catalog, StorageManager& storageManager);
     PageRange serializeCatalogSnapshot(const catalog::Catalog& catalog,
         StorageManager& storageManager);
-    PageRange serializeMetadata(const catalog::Catalog& catalog, StorageManager& storageManager);
+    PageRange serializeMetadata(const catalog::Catalog& catalog, StorageManager& storageManager,
+        const std::vector<PageRange>& livePageRanges);
     PageRange serializeMetadataSnapshot(const catalog::Catalog& catalog,
-        StorageManager& storageManager);
+        StorageManager& storageManager, const std::vector<PageRange>& livePageRanges);
 
 protected:
     main::ClientContext& clientContext;
     bool isInMemory;
     bool walRotated = false;
+    bool shadowApplicationStarted = false;
     // Snapshot timestamp captured at drain time for MVCC catalog serialization.
     common::transaction_t snapshotTS = 0;
     // Database header captured during beginCheckpoint for use in finishCheckpoint.

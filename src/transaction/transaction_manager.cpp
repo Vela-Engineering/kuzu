@@ -23,6 +23,10 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
     TransactionType type) {
     std::unique_lock newTransactionLck{mtxForStartingNewTransactions};
     std::unique_lock publicFunctionLck{mtxForSerializingPublicFunctionCalls};
+    if (checkpointRecoveryRequired) {
+        throw TransactionManagerException(
+            "The database must be restarted to recover from an interrupted checkpoint.");
+    }
     switch (type) {
     case TransactionType::READ_ONLY: {
         auto transaction =
@@ -234,8 +238,9 @@ bool TransactionManager::shouldRunAutoCheckpoint(main::ClientContext& clientCont
     if (!clientContext.getDBConfig()->autoCheckpoint) {
         return false;
     }
-    return WAL::Get(clientContext)->getFileSize() >
-           clientContext.getDBConfig()->checkpointThreshold;
+    auto wal = WAL::Get(clientContext);
+    return !wal->hasFrozenWAL() &&
+           wal->getFileSize() > clientContext.getDBConfig()->checkpointThreshold;
 }
 
 void TransactionManager::clearAutoCheckpointErrorMessage() {
@@ -274,31 +279,59 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     } catch (std::exception& e) {
         throw CheckpointException{e};
     }
+    if (checkpointRecoveryRequired) {
+        throw CheckpointException{TransactionManagerException(
+            "The database must be restarted to recover from an interrupted checkpoint.")};
+    }
     init_checkpointer_func_t initFunc;
     {
         std::lock_guard initFuncLck{mtxForInitCheckpointerFunc};
         initFunc = initCheckpointerFunc;
     }
     auto checkpointer = initFunc(clientContext);
+    const auto rollbackCheckpoint = [&]() {
+        try {
+            checkpointer->rollback();
+        } catch (std::exception& e) {
+            checkpointRecoveryRequired = true;
+            throw CheckpointException{e};
+        }
+    };
     try {
         checkpointer->beginCheckpoint(lastTimestamp);
     } catch (std::exception& e) {
-        checkpointer->rollback();
+        rollbackCheckpoint();
         throw CheckpointException{e};
     }
     try {
         checkpointer->checkpointStoragePhase();
     } catch (std::exception& e) {
-        checkpointer->rollback();
+        rollbackCheckpoint();
         throw CheckpointException{e};
     }
     try {
         checkpointer->finishCheckpoint();
     } catch (std::exception& e) {
-        checkpointer->rollback();
+        if (checkpointer->wasShadowApplicationStarted()) {
+            checkpointRecoveryRequired = true;
+        }
+        rollbackCheckpoint();
+        if (!checkpointer->wasShadowApplicationStarted() && !checkpointer->wasWalRotated()) {
+            try {
+                WAL::Get(clientContext)->reset();
+            } catch (std::exception& cleanupError) {
+                checkpointRecoveryRequired = true;
+                throw CheckpointException{cleanupError};
+            }
+        }
         throw CheckpointException{e};
     }
-    checkpointer->postCheckpointCleanup();
+    try {
+        checkpointer->postCheckpointCleanup();
+    } catch (std::exception& e) {
+        checkpointRecoveryRequired = true;
+        throw CheckpointException{e};
+    }
 }
 
 } // namespace transaction

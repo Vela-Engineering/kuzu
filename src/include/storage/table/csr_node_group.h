@@ -160,6 +160,16 @@ struct CSRNodeGroupCheckpointState final : NodeGroupCheckpointState {
           csrOffsetColumn{csrOffsetCol}, csrLengthColumn{csrLengthCol} {}
 };
 
+struct PreparedCSRNodeGroupCheckpoint final : PreparedNodeGroupCheckpointBase {
+    std::unique_ptr<ChunkedNodeGroup> persistentChunkGroup;
+    std::vector<common::LogicalType> checkpointedDataTypes;
+    bool replacePersistentChunkGroup = false;
+    bool reclaimOldStorage = false;
+    bool clearInMemoryState = false;
+    bool resetPersistentNumRowsFromChunks = false;
+    bool resetPersistentVersionAndUpdateInfo = false;
+};
+
 static constexpr common::column_id_t NBR_ID_COLUMN_ID = 0;
 static constexpr common::column_id_t REL_ID_COLUMN_ID = 1;
 
@@ -209,6 +219,10 @@ public:
     void addColumn(TableAddColumnState& addColumnState, PageAllocator* pageAllocator,
         ColumnStats* newColumnStats) override;
 
+    std::unique_ptr<PreparedNodeGroupCheckpointBase> prepareCheckpoint(
+        MemoryManager& memoryManager, NodeGroupCheckpointState& state) override;
+    void installCheckpoint(std::unique_ptr<PreparedNodeGroupCheckpointBase> checkpoint,
+        PageAllocator& pageAllocator) override;
     void checkpoint(MemoryManager& memoryManager, NodeGroupCheckpointState& state) override;
     void reclaimStorage(PageAllocator& pageAllocator, const common::UniqLock& lock) const override;
 
@@ -247,9 +261,17 @@ private:
     NodeGroupScanResult scanCommittedInMemRandom(const transaction::Transaction* transaction,
         const RelTableScanState& tableState, CSRNodeGroupScanState& nodeGroupScanState) const;
 
-    void checkpointInMemOnly(const common::UniqLock& lock, NodeGroupCheckpointState& state);
-    void checkpointInMemAndOnDisk(const common::UniqLock& lock, NodeGroupCheckpointState& state);
+    PreparedCSRNodeGroupCheckpoint prepareCheckpointNoLock(const common::UniqLock& lock,
+        NodeGroupCheckpointState& state);
+    void installCheckpointNoLock(const common::UniqLock& lock,
+        PreparedCSRNodeGroupCheckpoint checkpoint, PageAllocator& pageAllocator);
+    PreparedCSRNodeGroupCheckpoint checkpointInMemOnly(const common::UniqLock& lock,
+        NodeGroupCheckpointState& state);
+    PreparedCSRNodeGroupCheckpoint checkpointInMemAndOnDisk(const common::UniqLock& lock,
+        NodeGroupCheckpointState& state);
 
+    row_idx_vec_t getLiveInMemRowsForNode(common::offset_t nodeOffset,
+        const transaction::Transaction* transaction, const common::UniqLock& lock) const;
     void populateCSRLengthInMemOnly(const common::UniqLock& lock, common::offset_t numNodes,
         const CSRNodeGroupCheckpointState& csrState);
 
@@ -275,12 +297,12 @@ private:
     static bool isWithinDensityBound(const InMemChunkedCSRHeader& header,
         const std::vector<CSRRegion>& leafRegions, const CSRRegion& region);
 
-    void checkpointColumn(const common::UniqLock& lock, common::column_id_t columnID,
+    std::unique_ptr<ColumnChunk> checkpointColumnOutOfPlace(const common::UniqLock& lock,
+        common::column_id_t columnID, common::idx_t checkpointColumnIdx,
         const CSRNodeGroupCheckpointState& csrState, const std::vector<CSRRegion>& regions) const;
     std::vector<ChunkCheckpointState> checkpointColumnInRegion(const common::UniqLock& lock,
-        common::column_id_t columnID, const CSRNodeGroupCheckpointState& csrState,
-        const CSRRegion& region) const;
-    void checkpointCSRHeaderColumns(const CSRNodeGroupCheckpointState& csrState) const;
+        common::column_id_t columnID, common::idx_t checkpointColumnIdx,
+        const CSRNodeGroupCheckpointState& csrState, const CSRRegion& region) const;
     void finalizeCheckpoint(const common::UniqLock& lock);
 
 private:

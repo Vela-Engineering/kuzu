@@ -86,8 +86,8 @@ static uint64_t getReadOffset(Deserializer& deSer, bool enableChecksums) {
 void WALReplayer::replay(bool throwOnWalReplayFailure, bool enableChecksums) const {
     auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
     Checkpointer checkpointer(clientContext);
-    bool hasFrozenWAL = vfs->fileOrPathExists(checkpointWalPath, &clientContext);
-    bool hasActiveWAL = vfs->fileOrPathExists(walPath, &clientContext);
+    const bool hasFrozenWAL = vfs->fileOrPathExists(checkpointWalPath, &clientContext);
+    const bool hasActiveWAL = vfs->fileOrPathExists(walPath, &clientContext);
 
     if (!hasFrozenWAL && !hasActiveWAL) {
         removeFileIfExists(shadowFilePath);
@@ -95,99 +95,93 @@ void WALReplayer::replay(bool throwOnWalReplayFailure, bool enableChecksums) con
         return;
     }
 
+    std::unique_ptr<FileInfo> frozenFileInfo;
+    std::unique_ptr<FileInfo> activeFileInfo;
+    WALReplayInfo frozenReplayInfo;
+    WALReplayInfo activeReplayInfo;
     if (hasFrozenWAL) {
-        replayFrozenWAL(checkpointer, throwOnWalReplayFailure, enableChecksums);
-    } else {
-        removeFileIfExists(shadowFilePath);
-        checkpointer.readCheckpoint();
+        frozenFileInfo = openWALFile(checkpointWalPath);
+        if (frozenFileInfo->getFileSize() > 0) {
+            syncWALFile(*frozenFileInfo);
+            frozenReplayInfo =
+                dryReplay(*frozenFileInfo, throwOnWalReplayFailure, enableChecksums);
+        }
     }
-
     if (hasActiveWAL) {
-        replayActiveWAL(checkpointer, throwOnWalReplayFailure, enableChecksums);
+        activeFileInfo = openWALFile(walPath);
+        if (activeFileInfo->getFileSize() > 0) {
+            syncWALFile(*activeFileInfo);
+            activeReplayInfo = dryReplay(*activeFileInfo, throwOnWalReplayFailure, enableChecksums);
+        }
     }
-}
 
-void WALReplayer::replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
-    bool enableChecksums) const {
-    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
-    auto fileInfo =
-        vfs->openFile(checkpointWalPath, FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE));
-    if (fileInfo->getFileSize() == 0) {
-        removeFileIfExists(checkpointWalPath);
-        removeFileIfExists(shadowFilePath);
-        checkpointer.readCheckpoint();
-        return;
-    }
-    syncWALFile(*fileInfo);
+    const auto replayShadowPagesIfPresent = [&]() {
+        if (!vfs->fileOrPathExists(shadowFilePath, &clientContext)) {
+            return;
+        }
+        auto shadowFileInfo = vfs->openFile(shadowFilePath,
+            FileOpenFlags(FileFlags::READ_ONLY), &clientContext);
+        if (shadowFileInfo->getFileSize() == 0) {
+            return;
+        }
+        shadowFileInfo.reset();
+        ShadowFile::replayShadowPageRecords(clientContext);
+    };
 
     try {
-        auto [offsetDeserialized, isLastRecordCheckpoint] =
-            dryReplay(*fileInfo, throwOnWalReplayFailure, enableChecksums);
-        if (isLastRecordCheckpoint) {
-            ShadowFile::replayShadowPageRecords(clientContext);
-            removeFileIfExists(checkpointWalPath);
-            removeFileIfExists(shadowFilePath);
-            checkpointer.readCheckpoint();
-        } else {
-            removeFileIfExists(shadowFilePath);
-            checkpointer.readCheckpoint();
-            Deserializer deserializer = initDeserializer(*fileInfo, clientContext, enableChecksums);
-            if (offsetDeserialized > 0) {
-                deserializer.getReader()->onObjectBegin();
-                const auto walHeader = readWALHeader(deserializer);
-                FileDBIDUtils::verifyDatabaseID(*fileInfo,
-                    StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
-                    walHeader.databaseID);
-                deserializer.getReader()->onObjectEnd();
+        if (activeReplayInfo.isLastRecordCheckpoint) {
+            if (frozenReplayInfo.isLastRecordCheckpoint) {
+                throw RuntimeException("Both the active and checkpoint WAL files end with a "
+                                       "checkpoint record.");
             }
-            while (getReadOffset(deserializer, enableChecksums) < offsetDeserialized) {
-                KU_ASSERT(!deserializer.finished());
-                auto walRecord = WALRecord::deserialize(deserializer, clientContext);
-                replayWALRecord(*walRecord);
-            }
+            frozenFileInfo.reset();
+            activeFileInfo.reset();
+            replayShadowPagesIfPresent();
             removeFileIfExists(checkpointWalPath);
-        }
-    } catch (const std::exception&) {
-        auto transactionContext = TransactionContext::Get(clientContext);
-        if (transactionContext->hasActiveTransaction()) {
-            transactionContext->rollback();
-        }
-        throw;
-    }
-}
-
-void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
-    bool enableChecksums) const {
-    auto fileInfo = openWALFile();
-    if (fileInfo->getFileSize() == 0) {
-        removeFileIfExists(walPath);
-        return;
-    }
-    syncWALFile(*fileInfo);
-
-    try {
-        auto [offsetDeserialized, isLastRecordCheckpoint] =
-            dryReplay(*fileInfo, throwOnWalReplayFailure, enableChecksums);
-        if (isLastRecordCheckpoint) {
-            ShadowFile::replayShadowPageRecords(clientContext);
             removeWALAndShadowFiles();
             checkpointer.readCheckpoint();
+            return;
+        }
+
+        bool replayedFrozenWAL = false;
+        if (frozenFileInfo) {
+            if (frozenFileInfo->getFileSize() == 0 || frozenReplayInfo.offsetDeserialized == 0) {
+                frozenFileInfo.reset();
+                removeFileIfExists(checkpointWalPath);
+                removeFileIfExists(shadowFilePath);
+                checkpointer.readCheckpoint();
+            } else if (frozenReplayInfo.isLastRecordCheckpoint) {
+                frozenFileInfo.reset();
+                replayShadowPagesIfPresent();
+                removeFileIfExists(checkpointWalPath);
+                removeFileIfExists(shadowFilePath);
+                checkpointer.readCheckpoint();
+            } else {
+                removeFileIfExists(shadowFilePath);
+                checkpointer.readCheckpoint();
+                replayWALFile(*frozenFileInfo, frozenReplayInfo, enableChecksums);
+                truncateWALFile(*frozenFileInfo, frozenReplayInfo.offsetDeserialized);
+                replayedFrozenWAL = true;
+            }
         } else {
-            Deserializer deserializer = initDeserializer(*fileInfo, clientContext, enableChecksums);
-            if (offsetDeserialized > 0) {
-                deserializer.getReader()->onObjectBegin();
-                const auto walHeader = readWALHeader(deserializer);
-                FileDBIDUtils::verifyDatabaseID(*fileInfo,
-                    StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
-                    walHeader.databaseID);
-                deserializer.getReader()->onObjectEnd();
+            removeFileIfExists(shadowFilePath);
+            checkpointer.readCheckpoint();
+        }
+
+        if (activeFileInfo) {
+            if (activeFileInfo->getFileSize() == 0) {
+                activeFileInfo.reset();
+                removeFileIfExists(walPath);
+            } else {
+                replayWALFile(*activeFileInfo, activeReplayInfo, enableChecksums);
+                truncateWALFile(*activeFileInfo, activeReplayInfo.offsetDeserialized);
             }
-            while (getReadOffset(deserializer, enableChecksums) < offsetDeserialized) {
-                KU_ASSERT(!deserializer.finished());
-                auto walRecord = WALRecord::deserialize(deserializer, clientContext);
-                replayWALRecord(*walRecord);
-            }
-            truncateWALFile(*fileInfo, offsetDeserialized);
+        }
+
+        if (replayedFrozenWAL && !StorageManager::Get(clientContext)->isReadOnly()) {
+            frozenFileInfo.reset();
+            activeFileInfo.reset();
+            checkpointer.writeRecoveryCheckpoint();
         }
     } catch (const std::exception&) {
         auto transactionContext = TransactionContext::Get(clientContext);
@@ -195,6 +189,24 @@ void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalRep
             transactionContext->rollback();
         }
         throw;
+    }
+}
+
+void WALReplayer::replayWALFile(FileInfo& fileInfo, const WALReplayInfo& replayInfo,
+    bool enableChecksums) const {
+    Deserializer deserializer = initDeserializer(fileInfo, clientContext, enableChecksums);
+    if (replayInfo.offsetDeserialized > 0) {
+        deserializer.getReader()->onObjectBegin();
+        const auto walHeader = readWALHeader(deserializer);
+        FileDBIDUtils::verifyDatabaseID(fileInfo,
+            StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
+            walHeader.databaseID);
+        deserializer.getReader()->onObjectEnd();
+    }
+    while (getReadOffset(deserializer, enableChecksums) < replayInfo.offsetDeserialized) {
+        KU_ASSERT(!deserializer.finished());
+        auto walRecord = WALRecord::deserialize(deserializer, clientContext);
+        replayWALRecord(*walRecord);
     }
 }
 
@@ -590,8 +602,8 @@ void WALReplayer::replayLoadExtensionRecord(const WALRecord& walRecord) const {
 }
 
 void WALReplayer::removeWALAndShadowFiles() const {
-    removeFileIfExists(shadowFilePath);
     removeFileIfExists(walPath);
+    removeFileIfExists(shadowFilePath);
 }
 
 void WALReplayer::removeFileIfExists(const std::string& path) const {
@@ -604,13 +616,13 @@ void WALReplayer::removeFileIfExists(const std::string& path) const {
     }
 }
 
-std::unique_ptr<FileInfo> WALReplayer::openWALFile() const {
+std::unique_ptr<FileInfo> WALReplayer::openWALFile(const std::string& path) const {
     auto flag = FileFlags::READ_ONLY;
     if (!StorageManager::Get(clientContext)->isReadOnly()) {
         flag |= FileFlags::WRITE; // The write flag here is to ensure the file is opened with O_RDWR
                                   // so that we can sync it.
     }
-    return VirtualFileSystem::GetUnsafe(clientContext)->openFile(walPath, FileOpenFlags(flag));
+    return VirtualFileSystem::GetUnsafe(clientContext)->openFile(path, FileOpenFlags(flag));
 }
 
 void WALReplayer::syncWALFile(const FileInfo& fileInfo) const {

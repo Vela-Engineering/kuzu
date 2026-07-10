@@ -242,24 +242,36 @@ void RelTableData::pushInsertInfo(const Transaction* transaction, const CSRNodeG
         getVersionRecordHandler(source), shouldIncrementNumRows);
 }
 
-void RelTableData::checkpoint(const std::vector<column_id_t>& columnIDs,
-    PageAllocator& pageAllocator, const Transaction* snapshotTxn) {
-    std::vector<std::unique_ptr<Column>> checkpointColumns;
-    for (auto i = 0u; i < columnIDs.size(); i++) {
-        const auto columnID = columnIDs[i];
-        checkpointColumns.push_back(std::move(columns[columnID]));
-    }
-    columns = std::move(checkpointColumns);
-
+PreparedRelTableDataCheckpoint RelTableData::prepareCheckpoint(
+    const std::vector<column_id_t>& columnIDs, PageAllocator& pageAllocator,
+    const Transaction* snapshotTxn) {
     std::vector<Column*> checkpointColumnPtrs;
-    for (const auto& column : columns) {
-        checkpointColumnPtrs.push_back(column.get());
+    checkpointColumnPtrs.reserve(columnIDs.size());
+    for (const auto columnID : columnIDs) {
+        checkpointColumnPtrs.push_back(columns[columnID].get());
     }
 
     CSRNodeGroupCheckpointState state{columnIDs, std::move(checkpointColumnPtrs), pageAllocator, mm,
         csrHeaderColumns.offset.get(), csrHeaderColumns.length.get()};
     state.transaction = snapshotTxn;
-    nodeGroups->checkpoint(*mm, state);
+    return {columnIDs, nodeGroups->prepareCheckpoint(*mm, state)};
+}
+
+void RelTableData::installCheckpoint(PreparedRelTableDataCheckpoint checkpoint,
+    PageAllocator& pageAllocator) {
+    std::vector<std::unique_ptr<Column>> checkpointColumns;
+    checkpointColumns.reserve(checkpoint.columnIDs.size());
+    for (const auto columnID : checkpoint.columnIDs) {
+        checkpointColumns.push_back(std::move(columns[columnID]));
+    }
+    columns = std::move(checkpointColumns);
+    nodeGroups->installCheckpoint(std::move(checkpoint.nodeGroups), pageAllocator);
+}
+
+void RelTableData::checkpoint(const std::vector<column_id_t>& columnIDs,
+    PageAllocator& pageAllocator, const Transaction* snapshotTxn) {
+    auto preparedCheckpoint = prepareCheckpoint(columnIDs, pageAllocator, snapshotTxn);
+    installCheckpoint(std::move(preparedCheckpoint), pageAllocator);
 }
 
 void RelTableData::serialize(Serializer& serializer) const {

@@ -137,6 +137,7 @@ void ShadowFile::replayShadowPageRecords(ClientContext& context) {
             record.originalPageIdx * KUZU_PAGE_SIZE);
         shadowPageIdx++;
     }
+    dataFileInfo->syncFile();
 }
 
 void ShadowFile::flushAll(main::ClientContext& context) const {
