@@ -1,8 +1,13 @@
 #pragma once
 
+#include <functional>
+
 #include "storage/wal/wal_record.h"
 
 namespace kuzu {
+namespace testing {
+class BaseGraphTest;
+} // namespace testing
 namespace common {
 class BufferedFileWriter;
 class VirtualFileSystem;
@@ -11,6 +16,8 @@ class VirtualFileSystem;
 namespace storage {
 class LocalWAL;
 class WAL {
+    friend class testing::BaseGraphTest;
+
 public:
     WAL(const std::string& dbPath, bool readOnly, bool enableChecksums,
         common::VirtualFileSystem* vfs);
@@ -34,9 +41,10 @@ public:
     static WAL* Get(const main::ClientContext& context);
 
 private:
+    void setCommitSyncHookForTesting(std::function<void()> hook);
     void initWriter(main::ClientContext* context);
     void addNewWALRecordNoLock(const WALRecord& walRecord);
-    void flushAndSyncNoLock();
+    void flushAndSyncNoLock(bool isCommit = false);
     void writeHeader(main::ClientContext& context);
 
 private:
@@ -54,6 +62,7 @@ private:
     std::unique_ptr<common::Serializer> serializer;
     bool enableChecksums;
     bool syncFileCreationOnNextFlush;
+    std::function<void()> commitSyncHookForTesting;
 };
 
 } // namespace storage

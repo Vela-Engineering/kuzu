@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 
 #include "common/types/types.h"
@@ -115,7 +116,7 @@ public:
 
     bool shouldForceCheckpoint() const;
 
-    void commit(storage::WAL* wal);
+    void commit(storage::WAL* wal, const std::function<void()>& beforePublicationHook = {});
     void rollback(storage::WAL* wal);
 
     storage::LocalStorage* getLocalStorage() const { return localStorage.get(); }

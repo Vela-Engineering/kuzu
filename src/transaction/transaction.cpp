@@ -1,5 +1,6 @@
 #include "transaction/transaction.h"
 
+#include "common/exception/commit.h"
 #include "common/exception/runtime.h"
 #include "main/client_context.h"
 #include "main/db_config.h"
@@ -60,18 +61,31 @@ bool Transaction::shouldForceCheckpoint() const {
     return !clientContext->isInMemory() && forceCheckpoint;
 }
 
-void Transaction::commit(storage::WAL* wal) {
+void Transaction::commit(storage::WAL* wal, const std::function<void()>& beforePublicationHook) {
     localStorage->commit();
-    undoBuffer->commit(commitTS);
     if (shouldLogToWAL()) {
         KU_ASSERT(localWAL && wal);
         localWAL->logCommit();
-        wal->logCommittedWAL(*localWAL, clientContext);
-        localWAL->clear();
+        try {
+            wal->logCommittedWAL(*localWAL, clientContext);
+        } catch (std::exception& e) {
+            throw common::WALCommitException{e};
+        }
     }
-    if (hasCatalogChanges) {
-        Catalog::Get(*clientContext)->incrementVersion();
-        hasCatalogChanges = false;
+    try {
+        if (beforePublicationHook) {
+            beforePublicationHook();
+        }
+        undoBuffer->commit(commitTS);
+        if (shouldLogToWAL()) {
+            localWAL->clear();
+        }
+        if (hasCatalogChanges) {
+            Catalog::Get(*clientContext)->incrementVersion();
+            hasCatalogChanges = false;
+        }
+    } catch (std::exception& e) {
+        throw common::FatalCommitException{e};
     }
 }
 

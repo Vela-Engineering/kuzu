@@ -1,6 +1,7 @@
 #include "transaction/transaction_manager.h"
 
 #include "common/exception/checkpoint.h"
+#include "common/exception/commit.h"
 #include "common/exception/transaction_manager.h"
 #include "main/attached_database.h"
 #include "main/client_context.h"
@@ -26,6 +27,10 @@ Transaction* TransactionManager::beginTransaction(main::ClientContext& clientCon
     if (checkpointRecoveryRequired) {
         throw TransactionManagerException(
             "The database must be restarted to recover from an interrupted checkpoint.");
+    }
+    if (commitRecoveryRequired) {
+        throw TransactionManagerException(
+            "The database must be restarted to recover from a failed commit.");
     }
     switch (type) {
     case TransactionType::READ_ONLY: {
@@ -73,9 +78,25 @@ void TransactionManager::commit(main::ClientContext& clientContext, Transaction*
         } break;
         case TransactionType::RECOVERY:
         case TransactionType::WRITE: {
+            if (commitRecoveryRequired) {
+                throw TransactionManagerException(
+                    "The database must be restarted to recover from a failed commit.");
+            }
             lastTimestamp++;
             transaction->commitTS = lastTimestamp;
-            transaction->commit(&wal);
+            try {
+                transaction->commit(&wal, commitPublicationHookForTesting);
+            } catch (WALCommitException&) {
+                commitRecoveryRequired = true;
+                clearTransactionNoLock(transaction->getID());
+                decrementActiveWriteTransactionCount();
+                throw;
+            } catch (FatalCommitException&) {
+                commitRecoveryRequired = true;
+                clearTransactionNoLock(transaction->getID());
+                decrementActiveWriteTransactionCount();
+                throw;
+            }
             shouldForceCheckpoint = transaction->shouldForceCheckpoint();
             if (!shouldForceCheckpoint) {
                 shouldAutoCheckpoint = Checkpointer::canAutoCheckpoint(clientContext, *transaction);
@@ -184,6 +205,11 @@ void TransactionManager::setInitCheckpointerFuncForTesting(init_checkpointer_fun
     initCheckpointerFunc = std::move(initFunc);
 }
 
+void TransactionManager::setCommitPublicationHookForTesting(std::function<void()> hook) {
+    std::lock_guard lck{mtxForSerializingPublicFunctionCalls};
+    commitPublicationHookForTesting = std::move(hook);
+}
+
 void TransactionManager::scheduleAutoCheckpoint(main::ClientContext& clientContext) {
     if (clientContext.getAttachedDatabase() != nullptr) {
         checkpoint(clientContext);
@@ -282,6 +308,10 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     if (checkpointRecoveryRequired) {
         throw CheckpointException{TransactionManagerException(
             "The database must be restarted to recover from an interrupted checkpoint.")};
+    }
+    if (commitRecoveryRequired) {
+        throw CheckpointException{TransactionManagerException(
+            "The database must be restarted to recover from a failed commit.")};
     }
     init_checkpointer_func_t initFunc;
     {

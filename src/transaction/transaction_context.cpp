@@ -1,5 +1,6 @@
 #include "transaction/transaction_context.h"
 
+#include "common/exception/commit.h"
 #include "common/exception/transaction_manager.h"
 #include "main/client_context.h"
 #include "main/database.h"
@@ -56,7 +57,16 @@ void TransactionContext::commit() {
     if (!hasActiveTransaction()) {
         return;
     }
-    clientContext.getDatabase()->getTransactionManager()->commit(clientContext, activeTransaction);
+    try {
+        clientContext.getDatabase()->getTransactionManager()->commit(
+            clientContext, activeTransaction);
+    } catch (WALCommitException&) {
+        clearTransaction();
+        throw;
+    } catch (FatalCommitException&) {
+        clearTransaction();
+        throw;
+    }
     clearTransaction();
 }
 

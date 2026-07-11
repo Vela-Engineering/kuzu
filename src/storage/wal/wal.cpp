@@ -35,7 +35,7 @@ void WAL::logCommittedWAL(LocalWAL& localWAL, main::ClientContext* context) {
     std::unique_lock lck{mtx};
     initWriter(context);
     localWAL.inMemWriter->flush(*serializer->getWriter());
-    flushAndSyncNoLock();
+    flushAndSyncNoLock(true);
 }
 
 void WAL::logAndFlushCheckpoint(main::ClientContext* context) {
@@ -126,8 +126,11 @@ void WAL::reset() {
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const): semantically non-const function.
-void WAL::flushAndSyncNoLock() {
+void WAL::flushAndSyncNoLock(bool isCommit) {
     serializer->getWriter()->flush();
+    if (isCommit && commitSyncHookForTesting) {
+        commitSyncHookForTesting();
+    }
     serializer->getWriter()->sync();
     if (syncFileCreationOnNextFlush) {
 #if !defined(__WASM__)
@@ -135,6 +138,11 @@ void WAL::flushAndSyncNoLock() {
 #endif
         syncFileCreationOnNextFlush = false;
     }
+}
+
+void WAL::setCommitSyncHookForTesting(std::function<void()> hook) {
+    std::unique_lock lck{mtx};
+    commitSyncHookForTesting = std::move(hook);
 }
 
 uint64_t WAL::getFileSize() {

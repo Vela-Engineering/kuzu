@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 
 #include "common/string_format.h"
 #include "gtest/gtest.h"
@@ -99,6 +100,10 @@ protected:
     static storage::StorageManager* getStorageManager(main::Database& database) {
         return database.storageManager.get();
     }
+
+    static void setCommitSyncHook(main::Database& database, std::function<void()> hook);
+
+    static void setCommitPublicationHook(main::Database& database, std::function<void()> hook);
 
     // Static functions to access Connection's non-public properties/interfaces.
     static main::ClientContext* getClientContext(const main::Connection& connection) {

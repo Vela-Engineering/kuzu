@@ -7,7 +7,10 @@
 #include "common/string_format.h"
 #include "common/string_utils.h"
 #include "spdlog/spdlog.h"
+#include "storage/storage_manager.h"
+#include "storage/wal/wal.h"
 #include "test_helper/test_helper.h"
+#include "transaction/transaction_manager.h"
 
 using namespace kuzu::common;
 using namespace kuzu::main;
@@ -40,6 +43,14 @@ void BaseGraphTest::createDBAndConn() {
     database = std::make_unique<Database>(databasePath, *systemConfig);
     conn = std::make_unique<Connection>(database.get());
     spdlog::set_level(spdlog::level::info);
+}
+
+void BaseGraphTest::setCommitSyncHook(Database& database, std::function<void()> hook) {
+    database.storageManager->getWAL().setCommitSyncHookForTesting(std::move(hook));
+}
+
+void BaseGraphTest::setCommitPublicationHook(Database& database, std::function<void()> hook) {
+    database.transactionManager->setCommitPublicationHookForTesting(std::move(hook));
 }
 
 void BaseGraphTest::initGraph(const std::string& datasetDir) const {
