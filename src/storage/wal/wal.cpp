@@ -23,7 +23,7 @@ WAL::WAL(const std::string& dbPath, bool readOnly, bool enableChecksums, Virtual
     : walPath{StorageUtils::getWALFilePath(dbPath)},
       checkpointWalPath{StorageUtils::getCheckpointWALFilePath(dbPath)},
       inMemory{main::DBConfig::isDBPathInMemory(dbPath)}, readOnly{readOnly}, vfs{vfs},
-      enableChecksums(enableChecksums) {}
+      enableChecksums(enableChecksums), syncFileCreationOnNextFlush{false} {}
 
 WAL::~WAL() {}
 
@@ -64,7 +64,11 @@ bool WAL::rotateForCheckpoint(main::ClientContext* /*context*/) {
         fileInfo.reset();
         serializer.reset();
     }
+#if defined(__WASM__)
     vfs->renameFile(walPath, checkpointWalPath);
+#else
+    vfs->renameFileDurably(walPath, checkpointWalPath);
+#endif
     return true;
 }
 
@@ -89,7 +93,13 @@ void WAL::logAndFlushCheckpointToFrozen(main::ClientContext* context) {
 }
 
 void WAL::clearFrozenWAL() {
+#if defined(__WASM__)
     vfs->removeFileIfExists(checkpointWalPath);
+#else
+    if (!inMemory) {
+        vfs->removeFileIfExistsDurably(checkpointWalPath);
+    }
+#endif
 }
 
 bool WAL::hasFrozenWAL() const {
@@ -106,13 +116,25 @@ void WAL::reset() {
     std::unique_lock lck{mtx};
     fileInfo.reset();
     serializer.reset();
+#if defined(__WASM__)
     vfs->removeFileIfExists(walPath);
+#else
+    if (!inMemory) {
+        vfs->removeFileIfExistsDurably(walPath);
+    }
+#endif
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const): semantically non-const function.
 void WAL::flushAndSyncNoLock() {
     serializer->getWriter()->flush();
     serializer->getWriter()->sync();
+    if (syncFileCreationOnNextFlush) {
+#if !defined(__WASM__)
+        vfs->syncFileCreation(*fileInfo);
+#endif
+        syncFileCreationOnNextFlush = false;
+    }
 }
 
 uint64_t WAL::getFileSize() {
@@ -150,6 +172,7 @@ void WAL::initWriter(main::ClientContext* context) {
     // This is used to ensure that when replaying the WAL matches the database
     if (fileInfo->getFileSize() == 0) {
         writeHeader(*context);
+        syncFileCreationOnNextFlush = true;
     }
 
     // WAL should always be APPEND only. We don't want to overwrite the file as it may still

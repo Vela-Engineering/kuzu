@@ -160,6 +160,9 @@ void ShadowFile::flushAll(main::ClientContext& context) const {
     writer->flush();
     // Sync the file to disk.
     writer->sync();
+#if !defined(__WASM__)
+    vfs->syncFileCreation(*shadowingFH->getFileInfo());
+#endif
 }
 
 void ShadowFile::clear(BufferManager& bm) {
@@ -178,7 +181,11 @@ void ShadowFile::clear(BufferManager& bm) {
 void ShadowFile::reset() {
     shadowingFH->resetFileInfo();
     shadowingFH = nullptr;
+#if defined(__WASM__)
     vfs->removeFileIfExists(shadowFilePath);
+#else
+    vfs->removeFileIfExistsDurably(shadowFilePath);
+#endif
 }
 
 FileHandle* ShadowFile::getOrCreateShadowingFH() {

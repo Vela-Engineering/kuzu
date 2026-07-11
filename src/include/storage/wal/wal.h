@@ -53,6 +53,7 @@ private:
     // writing COMMIT/CHECKPOINT records
     std::unique_ptr<common::Serializer> serializer;
     bool enableChecksums;
+    bool syncFileCreationOnNextFlush;
 };
 
 } // namespace storage

@@ -11,6 +11,14 @@
 namespace kuzu {
 namespace common {
 
+static DurableFileSystem* getDurableFileSystem(FileSystem* fileSystem, const std::string& path) {
+    auto durableFileSystem = dynamic_cast<DurableFileSystem*>(fileSystem);
+    if (durableFileSystem == nullptr) {
+        throw IOException(stringFormat("Durable file operations are not supported for {}.", path));
+    }
+    return durableFileSystem;
+}
+
 VirtualFileSystem::VirtualFileSystem() : VirtualFileSystem{""} {}
 
 VirtualFileSystem::VirtualFileSystem(std::string homeDir) {
@@ -63,6 +71,16 @@ void VirtualFileSystem::renameFile(const std::string& from, const std::string& t
     defaultFS->renameFile(from, to);
 }
 
+void VirtualFileSystem::renameFileDurably(const std::string& from, const std::string& to) {
+    auto fromFileSystem = findFileSystem(from);
+    auto toFileSystem = findFileSystem(to);
+    if (fromFileSystem != toFileSystem) {
+        throw IOException(stringFormat(
+            "Cannot durably rename {} to {} across different file systems.", from, to));
+    }
+    getDurableFileSystem(fromFileSystem, from)->renameFileDurably(from, to);
+}
+
 void VirtualFileSystem::createDir(const std::string& dir) const {
     findFileSystem(dir)->createDir(dir);
 }
@@ -70,6 +88,12 @@ void VirtualFileSystem::createDir(const std::string& dir) const {
 void VirtualFileSystem::removeFileIfExists(const std::string& path,
     const main::ClientContext* context) {
     findFileSystem(path)->removeFileIfExists(path, context);
+}
+
+void VirtualFileSystem::removeFileIfExistsDurably(const std::string& path,
+    const main::ClientContext* context) {
+    auto fileSystem = findFileSystem(path);
+    getDurableFileSystem(fileSystem, path)->removeFileIfExistsDurably(path, context);
 }
 
 bool VirtualFileSystem::fileOrPathExists(const std::string& path, main::ClientContext* context) {
@@ -97,6 +121,16 @@ void VirtualFileSystem::writeFile(FileInfo& /*fileInfo*/, const uint8_t* /*buffe
 
 void VirtualFileSystem::syncFile(const FileInfo& fileInfo) const {
     findFileSystem(fileInfo.path)->syncFile(fileInfo);
+}
+
+void VirtualFileSystem::syncFileCreation(const FileInfo& fileInfo) const {
+    auto fileSystem = findFileSystem(fileInfo.path);
+    getDurableFileSystem(fileSystem, fileInfo.path)->syncFileCreation(fileInfo);
+}
+
+void VirtualFileSystem::syncParentDirectory(const std::string& path) const {
+    auto fileSystem = findFileSystem(path);
+    getDurableFileSystem(fileSystem, path)->syncParentDirectory(path);
 }
 
 void VirtualFileSystem::cleanUP(main::ClientContext* context) {

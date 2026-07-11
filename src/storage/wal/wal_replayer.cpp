@@ -610,10 +610,15 @@ void WALReplayer::removeFileIfExists(const std::string& path) const {
     if (StorageManager::Get(clientContext)->isReadOnly()) {
         return;
     }
+#if !defined(__WASM__)
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    vfs->removeFileIfExistsDurably(path);
+#else
     auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
     if (vfs->fileOrPathExists(path, &clientContext)) {
         vfs->removeFileIfExists(path);
     }
+#endif
 }
 
 std::unique_ptr<FileInfo> WALReplayer::openWALFile(const std::string& path) const {

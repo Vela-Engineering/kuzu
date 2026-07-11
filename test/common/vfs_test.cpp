@@ -8,6 +8,49 @@
 
 using namespace kuzu::common;
 
+#if !defined(_WIN32) && !defined(__WASM__)
+TEST(VFSTests, SyncParentDirectory) {
+    const auto testDir = std::filesystem::temp_directory_path() / "kuzu_sync_parent_directory";
+    const auto filePath = testDir / "database.wal";
+    std::filesystem::remove_all(testDir);
+    std::filesystem::create_directories(testDir);
+    VirtualFileSystem vfs(filePath.string());
+
+    ASSERT_NO_THROW(vfs.syncParentDirectory(filePath.string()));
+
+    std::filesystem::remove_all(testDir);
+    ASSERT_THROW(vfs.syncParentDirectory(filePath.string()), IOException);
+}
+#endif
+
+#if !defined(__WASM__)
+TEST(VFSTests, DurableRenameAndRemove) {
+    const auto testDir = std::filesystem::temp_directory_path() / "kuzu_durable_file_operations";
+    const auto databasePath = testDir / "database";
+    const auto walPath = testDir / "database.wal";
+    const auto checkpointWalPath = testDir / "database.wal.checkpoint";
+    std::filesystem::remove_all(testDir);
+    std::filesystem::create_directories(testDir);
+    std::ofstream{walPath}.put('x');
+    VirtualFileSystem vfs(databasePath.string());
+
+    ASSERT_NO_THROW(vfs.renameFileDurably(walPath.string(), checkpointWalPath.string()));
+    ASSERT_FALSE(std::filesystem::exists(walPath));
+    ASSERT_TRUE(std::filesystem::exists(checkpointWalPath));
+
+    ASSERT_NO_THROW(vfs.removeFileIfExistsDurably(checkpointWalPath.string()));
+    ASSERT_FALSE(std::filesystem::exists(checkpointWalPath));
+#if defined(_WIN32)
+    const auto tombstonePath = checkpointWalPath.string() + ".tombstone";
+    std::ofstream{tombstonePath}.put('x');
+    ASSERT_NO_THROW(vfs.removeFileIfExistsDurably(checkpointWalPath.string()));
+    ASSERT_FALSE(std::filesystem::exists(tombstonePath));
+#endif
+
+    std::filesystem::remove_all(testDir);
+}
+#endif
+
 TEST(VFSTests, VirtualFileSystemDeleteFiles) {
     std::string homeDir = "/tmp/dbHome";
     kuzu::common::VirtualFileSystem vfs(homeDir);

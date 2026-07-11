@@ -17,7 +17,7 @@ class BufferManager;
 };
 namespace common {
 
-class KUZU_API VirtualFileSystem final : public FileSystem {
+class KUZU_API VirtualFileSystem final : public FileSystem, public DurableFileSystem {
     friend class storage::BufferManager;
 
 public:
@@ -38,9 +38,14 @@ public:
 
     void renameFile(const std::string& from, const std::string& to) override;
 
+    void renameFileDurably(const std::string& from, const std::string& to) override;
+
     void createDir(const std::string& dir) const override;
 
     void removeFileIfExists(const std::string& path,
+        const main::ClientContext* context = nullptr) override;
+
+    void removeFileIfExistsDurably(const std::string& path,
         const main::ClientContext* context = nullptr) override;
 
     bool fileOrPathExists(const std::string& path, main::ClientContext* context = nullptr) override;
@@ -48,6 +53,10 @@ public:
     std::string expandPath(main::ClientContext* context, const std::string& path) const override;
 
     void syncFile(const FileInfo& fileInfo) const override;
+
+    void syncFileCreation(const FileInfo& fileInfo) const override;
+
+    void syncParentDirectory(const std::string& path) const override;
 
     void cleanUP(main::ClientContext* context) override;
 

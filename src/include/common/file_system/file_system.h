@@ -43,6 +43,20 @@ struct FileOpenFlags {
     explicit FileOpenFlags(int flags, FileLockType lockType) : flags{flags}, lockType{lockType} {}
 };
 
+class KUZU_API DurableFileSystem {
+public:
+    virtual ~DurableFileSystem() = default;
+
+    virtual void renameFileDurably(const std::string& from, const std::string& to) = 0;
+
+    virtual void removeFileIfExistsDurably(const std::string& path,
+        const main::ClientContext* context = nullptr) = 0;
+
+    virtual void syncFileCreation(const FileInfo& fileInfo) const = 0;
+
+    virtual void syncParentDirectory(const std::string& path) const = 0;
+};
+
 class KUZU_API FileSystem {
     friend struct FileInfo;
 

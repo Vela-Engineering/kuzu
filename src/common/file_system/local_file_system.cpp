@@ -21,6 +21,7 @@
 
 #include <fcntl.h>
 
+#include <array>
 #include <cstring>
 
 #include "storage/storage_utils.h"
@@ -214,6 +215,46 @@ void LocalFileSystem::renameFile(const std::string& from, const std::string& to)
     }
 }
 
+void LocalFileSystem::renameFileDurably(const std::string& from, const std::string& to) {
+#if defined(_WIN32)
+    const auto unicodeFrom = WindowsUtils::utf8ToUnicode(from.c_str());
+    const auto unicodeTo = WindowsUtils::utf8ToUnicode(to.c_str());
+    const auto sourceHandle = CreateFileW(unicodeFrom.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (sourceHandle == INVALID_HANDLE_VALUE) {
+        const auto error = GetLastError();
+        throw IOException(stringFormat("Cannot open file {} for durable rename. Error {}: {}", from,
+            error, std::system_category().message(error)));
+    }
+    if (!FlushFileBuffers(sourceHandle)) {
+        const auto error = GetLastError();
+        CloseHandle(sourceHandle);
+        throw IOException(stringFormat("Cannot sync file {} for durable rename. Error {}: {}", from,
+            error, std::system_category().message(error)));
+    }
+    CloseHandle(sourceHandle);
+    if (!MoveFileExW(unicodeFrom.c_str(), unicodeTo.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const auto error = GetLastError();
+        throw IOException(stringFormat("Error durably renaming file {} to {}. Error {}: {}", from,
+            to, error, std::system_category().message(error)));
+    }
+#elif defined(__WASM__)
+    throw IOException(
+        stringFormat("Durably renaming file {} to {} is not supported on this platform.", from, to));
+#else
+    auto sourceFile = openFile(from, FileOpenFlags{FileFlags::WRITE});
+    syncFile(*sourceFile);
+    sourceFile.reset();
+    renameFile(from, to);
+    syncParentDirectory(to);
+    if (std::filesystem::path(from).parent_path() != std::filesystem::path(to).parent_path()) {
+        syncParentDirectory(from);
+    }
+#endif
+}
+
 void LocalFileSystem::copyFile(const std::string& from, const std::string& to) {
     if (!fileOrPathExists(from)) {
         return;
@@ -268,10 +309,13 @@ void LocalFileSystem::createDir(const std::string& dir) const {
 
 static std::unordered_set<std::string> getDatabaseFileSet(const std::string& path) {
     std::unordered_set<std::string> result;
-    result.insert(storage::StorageUtils::getWALFilePath(path));
-    result.insert(storage::StorageUtils::getCheckpointWALFilePath(path));
-    result.insert(storage::StorageUtils::getShadowFilePath(path));
-    result.insert(storage::StorageUtils::getTmpFilePath(path));
+    const std::array databaseFiles = {storage::StorageUtils::getWALFilePath(path),
+        storage::StorageUtils::getCheckpointWALFilePath(path),
+        storage::StorageUtils::getShadowFilePath(path), storage::StorageUtils::getTmpFilePath(path)};
+    for (const auto& databaseFile : databaseFiles) {
+        result.insert(databaseFile);
+        result.insert(databaseFile + ".tombstone");
+    }
     return result;
 }
 
@@ -289,15 +333,20 @@ static bool isExtensionFile(const main::ClientContext* context, const std::strin
     return true;
 }
 
+static void validateFileRemoval(const std::string& dbPath, const std::string& path,
+    const main::ClientContext* context) {
+    if (!getDatabaseFileSet(dbPath).contains(path) && !isExtensionFile(context, path)) {
+        throw IOException(stringFormat(
+            "Error: Path {} is not within the allowed list of files to be removed.", path));
+    }
+}
+
 void LocalFileSystem::removeFileIfExists(const std::string& path,
     const main::ClientContext* context) {
     if (!fileOrPathExists(path)) {
         return;
     }
-    if (!getDatabaseFileSet(dbPath).contains(path) && !isExtensionFile(context, path)) {
-        throw IOException(stringFormat(
-            "Error: Path {} is not within the allowed list of files to be removed.", path));
-    }
+    validateFileRemoval(dbPath, path, context);
     std::error_code errCode;
     bool success = false;
     if (std::filesystem::is_directory(path)) {
@@ -311,6 +360,39 @@ void LocalFileSystem::removeFileIfExists(const std::string& path,
             path, errCode.message()));
         // LCOV_EXCL_STOP
     }
+}
+
+void LocalFileSystem::removeFileIfExistsDurably(const std::string& path,
+    const main::ClientContext* context) {
+#if defined(_WIN32)
+    const auto tombstonePath = path + ".tombstone";
+    validateFileRemoval(dbPath, tombstonePath, context);
+    if (!fileOrPathExists(path)) {
+        std::error_code cleanupError;
+        std::filesystem::remove_all(tombstonePath, cleanupError);
+        return;
+    }
+    validateFileRemoval(dbPath, path, context);
+    const auto unicodePath = WindowsUtils::utf8ToUnicode(path.c_str());
+    const auto unicodeTombstonePath = WindowsUtils::utf8ToUnicode(tombstonePath.c_str());
+    if (!MoveFileExW(unicodePath.c_str(), unicodeTombstonePath.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const auto error = GetLastError();
+        throw IOException(stringFormat("Error durably removing file {}. Error {}: {}", path, error,
+            std::system_category().message(error)));
+    }
+    std::error_code cleanupError;
+    std::filesystem::remove_all(tombstonePath, cleanupError);
+#elif defined(__WASM__)
+    throw IOException(
+        stringFormat("Durably removing file {} is not supported on this platform.", path));
+#else
+    if (!fileOrPathExists(path)) {
+        return;
+    }
+    removeFileIfExists(path, context);
+    syncParentDirectory(path);
+#endif
 }
 
 bool LocalFileSystem::fileOrPathExists(const std::string& path, main::ClientContext* /*context*/) {
@@ -487,6 +569,50 @@ void LocalFileSystem::syncFile(const FileInfo& fileInfo) const {
 #endif
     if (!syncSuccess) {
         throw IOException(stringFormat("Failed to sync file {}.", fileInfo.path));
+    }
+#endif
+}
+
+void LocalFileSystem::syncFileCreation(const FileInfo& fileInfo) const {
+#if defined(_WIN32)
+    syncFile(fileInfo);
+#elif defined(__WASM__)
+    throw IOException(stringFormat(
+        "Syncing the creation of file {} is not supported on this platform.", fileInfo.path));
+#else
+    syncParentDirectory(fileInfo.path);
+#endif
+}
+
+void LocalFileSystem::syncParentDirectory(const std::string& path) const {
+#if defined(_WIN32) || defined(__WASM__)
+    throw IOException(stringFormat(
+        "Syncing the parent directory of {} is not supported on this platform.", path));
+#else
+    auto parentPath = std::filesystem::path(path).parent_path();
+    if (parentPath.empty()) {
+        parentPath = ".";
+    }
+    const auto directoryFD = open(parentPath.c_str(), O_RDONLY | O_DIRECTORY);
+    if (directoryFD == -1) {
+        throw IOException(stringFormat("Cannot open directory {} for sync: {}", parentPath.string(),
+            posixErrMessage()));
+    }
+    auto syncResult = -1;
+#if HAS_FULLFSYNC and defined(__APPLE__)
+    syncResult = fcntl(directoryFD, F_FULLFSYNC);
+    if (syncResult != 0 && (errno == ENOTSUP || errno == EINVAL)) {
+        syncResult = fsync(directoryFD);
+    }
+#else
+    syncResult = fsync(directoryFD);
+#endif
+    const auto syncError = errno;
+    close(directoryFD);
+    if (syncResult != 0) {
+        errno = syncError;
+        throw IOException(stringFormat("Failed to sync directory {}: {}", parentPath.string(),
+            posixErrMessage()));
     }
 #endif
 }
