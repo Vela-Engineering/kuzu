@@ -1,6 +1,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <vector>
 
 #include "common/types/types.h"
 #include "common/uniq_lock.h"
@@ -26,9 +27,11 @@ class AttachedKuzuDatabase;
 
 namespace storage {
 class StorageManager;
+class WALReplayer;
 
 class Checkpointer {
     friend class main::AttachedKuzuDatabase;
+    friend class WALReplayer;
     friend struct testing::FSMLeakChecker;
 
 public:
@@ -41,9 +44,15 @@ public:
     void checkpointStoragePhase();
     void finishCheckpoint();
     // Cleanup after the core checkpoint.
-    void postCheckpointCleanup();
+    virtual void postCheckpointCleanup();
+    void retryShadowApplication();
     void rollback();
     bool wasWalRotated() const { return walRotated; }
+    bool wasWalRotationStarted() const { return walRotationStarted; }
+    bool wasShadowApplicationStarted() const { return shadowApplicationStarted; }
+    bool wasCheckpointBeginWriteStarted() const { return checkpointBeginWriteStarted; }
+    bool wasCheckpointMarkerWriteStarted() const { return checkpointMarkerWriteStarted; }
+    bool wasCheckpointMarkerWritten() const { return checkpointMarkerWritten; }
 
     void readCheckpoint();
 
@@ -56,22 +65,33 @@ protected:
         bool hasStorageChanges);
     virtual void writeDatabaseHeader(const DatabaseHeader& header);
     virtual void logCheckpointAndApplyShadowPages(bool walRotated);
+    void markShadowApplicationStarted() { shadowApplicationStarted = true; }
+    void markCheckpointMarkerWriteStarted() { checkpointMarkerWriteStarted = true; }
+    void markCheckpointMarkerWritten() { checkpointMarkerWritten = true; }
 
 private:
     static void readCheckpoint(main::ClientContext* context, catalog::Catalog* catalog,
         StorageManager* storageManager);
+    void writeRecoveryCheckpoint();
 
     PageRange serializeCatalog(const catalog::Catalog& catalog, StorageManager& storageManager);
     PageRange serializeCatalogSnapshot(const catalog::Catalog& catalog,
         StorageManager& storageManager);
-    PageRange serializeMetadata(const catalog::Catalog& catalog, StorageManager& storageManager);
+    PageRange serializeMetadata(const catalog::Catalog& catalog, StorageManager& storageManager,
+        const std::vector<PageRange>& livePageRanges);
     PageRange serializeMetadataSnapshot(const catalog::Catalog& catalog,
-        StorageManager& storageManager);
+        StorageManager& storageManager, const std::vector<PageRange>& livePageRanges);
 
 protected:
     main::ClientContext& clientContext;
     bool isInMemory;
     bool walRotated = false;
+    bool walRotationStarted = false;
+    bool shadowApplicationStarted = false;
+    bool checkpointBeginWriteStarted = false;
+    bool checkpointMarkerWriteStarted = false;
+    bool checkpointMarkerWritten = false;
+    common::ku_uuid_t checkpointID{0};
     // Snapshot timestamp captured at drain time for MVCC catalog serialization.
     common::transaction_t snapshotTS = 0;
     // Database header captured during beginCheckpoint for use in finishCheckpoint.

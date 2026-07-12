@@ -1,5 +1,7 @@
 #include "storage/wal/wal_replayer.h"
 
+#include <limits>
+
 #include "binder/binder.h"
 #include "catalog/catalog_entry/scalar_macro_catalog_entry.h"
 #include "catalog/catalog_entry/sequence_catalog_entry.h"
@@ -13,6 +15,7 @@
 #include "main/client_context.h"
 #include "processor/expression_mapper.h"
 #include "storage/checkpointer.h"
+#include "storage/database_header.h"
 #include "storage/file_db_id_utils.h"
 #include "storage/local_storage/local_rel_table.h"
 #include "storage/storage_manager.h"
@@ -83,111 +86,212 @@ static uint64_t getReadOffset(Deserializer& deSer, bool enableChecksums) {
     }
 }
 
+static void verifyWALDatabaseID(main::ClientContext& context, FileInfo& walFileInfo,
+    ku_uuid_t walDatabaseID) {
+    auto vfs = VirtualFileSystem::GetUnsafe(context);
+    if (!vfs->fileOrPathExists(context.getDatabasePath(), &context)) {
+        throw RuntimeException(
+            "Found a checkpoint WAL but no corresponding database file.");
+    }
+    auto dataFileInfo =
+        vfs->openFile(context.getDatabasePath(), FileOpenFlags(FileFlags::READ_ONLY), &context);
+    const auto databaseHeader = DatabaseHeader::readDatabaseHeader(*dataFileInfo);
+    if (!databaseHeader.has_value()) {
+        throw RuntimeException("Found a checkpoint WAL but no valid database header.");
+    }
+    FileDBIDUtils::verifyDatabaseID(
+        walFileInfo, databaseHeader->databaseID, walDatabaseID);
+}
+
 void WALReplayer::replay(bool throwOnWalReplayFailure, bool enableChecksums) const {
     auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
     Checkpointer checkpointer(clientContext);
-    bool hasFrozenWAL = vfs->fileOrPathExists(checkpointWalPath, &clientContext);
-    bool hasActiveWAL = vfs->fileOrPathExists(walPath, &clientContext);
+    const bool hasFrozenWAL = vfs->fileOrPathExists(checkpointWalPath, &clientContext);
+    const bool hasActiveWAL = vfs->fileOrPathExists(walPath, &clientContext);
 
     if (!hasFrozenWAL && !hasActiveWAL) {
+        ShadowFile::rollbackCheckpoint(
+            clientContext, std::nullopt, std::nullopt, std::nullopt);
         removeFileIfExists(shadowFilePath);
         checkpointer.readCheckpoint();
         return;
     }
 
+    std::unique_ptr<FileInfo> frozenFileInfo;
+    std::unique_ptr<FileInfo> activeFileInfo;
+    WALReplayInfo frozenReplayInfo;
+    WALReplayInfo activeReplayInfo;
     if (hasFrozenWAL) {
-        replayFrozenWAL(checkpointer, throwOnWalReplayFailure, enableChecksums);
-    } else {
-        removeFileIfExists(shadowFilePath);
-        checkpointer.readCheckpoint();
+        frozenFileInfo = openWALFile(checkpointWalPath);
+        if (frozenFileInfo->getFileSize() > 0) {
+            syncWALFile(*frozenFileInfo);
+            frozenReplayInfo =
+                dryReplay(*frozenFileInfo, throwOnWalReplayFailure, enableChecksums);
+        }
     }
-
     if (hasActiveWAL) {
-        replayActiveWAL(checkpointer, throwOnWalReplayFailure, enableChecksums);
+        activeFileInfo = openWALFile(walPath);
+        if (activeFileInfo->getFileSize() > 0) {
+            syncWALFile(*activeFileInfo);
+            activeReplayInfo = dryReplay(*activeFileInfo, throwOnWalReplayFailure, enableChecksums);
+        }
     }
-}
 
-void WALReplayer::replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
-    bool enableChecksums) const {
-    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
-    auto fileInfo =
-        vfs->openFile(checkpointWalPath, FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE));
-    if (fileInfo->getFileSize() == 0) {
-        removeFileIfExists(checkpointWalPath);
-        removeFileIfExists(shadowFilePath);
-        checkpointer.readCheckpoint();
-        return;
-    }
-    syncWALFile(*fileInfo);
+    const auto replayShadowPagesIfPresent = [&](const WALReplayInfo& replayInfo) {
+        if (replayInfo.checkpointEndDataFileNumPages.has_value()) {
+            auto dataFileInfo = vfs->openFile(clientContext.getDatabasePath(),
+                FileOpenFlags(FileFlags::READ_ONLY), &clientContext);
+            const auto checkpointEndDataFileSize = static_cast<uint64_t>(
+                *replayInfo.checkpointEndDataFileNumPages) * KUZU_PAGE_SIZE;
+            if (dataFileInfo->getFileSize() > checkpointEndDataFileSize) {
+                throw RuntimeException(
+                    "Checkpoint end watermark is below the database file size.");
+            }
+            if (!vfs->fileOrPathExists(shadowFilePath, &clientContext) &&
+                dataFileInfo->getFileSize() != checkpointEndDataFileSize) {
+                throw RuntimeException(
+                    "Checkpoint marker has no shadow file and installation is ambiguous.");
+            }
+        }
+        if (!vfs->fileOrPathExists(shadowFilePath, &clientContext)) {
+            if (replayInfo.checkpointID.has_value() &&
+                replayInfo.checkpointStartDataFileNumPages.has_value() &&
+                replayInfo.checkpointEndDataFileNumPages.has_value()) {
+                // A valid V2 begin proves durable shadow creation, so absence after its marker
+                // means shadow application and shadow-first cleanup completed.
+                return;
+            }
+            throw RuntimeException(
+                "Legacy checkpoint marker has no shadow file; checkpoint state is ambiguous.");
+        }
+        auto shadowFileInfo = vfs->openFile(shadowFilePath,
+            FileOpenFlags(FileFlags::READ_ONLY), &clientContext);
+        if (shadowFileInfo->getFileSize() == 0) {
+            throw RuntimeException("Checkpoint shadow file is empty.");
+        }
+        shadowFileInfo.reset();
+        ShadowFile::replayShadowPageRecords(
+            clientContext, replayInfo.databaseID, replayInfo.checkpointID,
+            replayInfo.checkpointStartDataFileNumPages,
+            replayInfo.checkpointEndDataFileNumPages);
+    };
+    const auto rollbackShadowCheckpoint = [&]() {
+        if (frozenReplayInfo.checkpointID.has_value() &&
+            activeReplayInfo.checkpointID.has_value()) {
+            throw RuntimeException("Both WAL files contain unfinished checkpoints.");
+        }
+        const WALReplayInfo* replayInfo = nullptr;
+        if (frozenReplayInfo.checkpointID.has_value()) {
+            replayInfo = &frozenReplayInfo;
+        } else if (activeReplayInfo.checkpointID.has_value()) {
+            replayInfo = &activeReplayInfo;
+        } else if (frozenReplayInfo.hasHeader) {
+            replayInfo = &frozenReplayInfo;
+        } else if (activeReplayInfo.hasHeader) {
+            replayInfo = &activeReplayInfo;
+        }
+        if (!replayInfo) {
+            ShadowFile::rollbackCheckpoint(
+                clientContext, std::nullopt, std::nullopt, std::nullopt);
+            return;
+        }
+        ShadowFile::rollbackCheckpoint(clientContext, replayInfo->databaseID,
+            replayInfo->checkpointID, replayInfo->checkpointStartDataFileNumPages);
+    };
+    const auto validateWALBeforeShadowCleanup =
+        [&](FileInfo* fileInfo, const WALReplayInfo& replayInfo) {
+        if (!fileInfo || fileInfo->getFileSize() == 0) {
+            return;
+        }
+        if (!replayInfo.hasHeader) {
+            throw RuntimeException("Nonempty WAL has no valid header.");
+        }
+        verifyWALDatabaseID(clientContext, *fileInfo, replayInfo.databaseID);
+    };
 
     try {
-        auto [offsetDeserialized, isLastRecordCheckpoint] =
-            dryReplay(*fileInfo, throwOnWalReplayFailure, enableChecksums);
-        if (isLastRecordCheckpoint) {
-            ShadowFile::replayShadowPageRecords(clientContext);
-            removeFileIfExists(checkpointWalPath);
-            removeFileIfExists(shadowFilePath);
-            checkpointer.readCheckpoint();
-        } else {
-            removeFileIfExists(shadowFilePath);
-            checkpointer.readCheckpoint();
-            Deserializer deserializer = initDeserializer(*fileInfo, clientContext, enableChecksums);
-            if (offsetDeserialized > 0) {
-                deserializer.getReader()->onObjectBegin();
-                const auto walHeader = readWALHeader(deserializer);
-                FileDBIDUtils::verifyDatabaseID(*fileInfo,
-                    StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
-                    walHeader.databaseID);
-                deserializer.getReader()->onObjectEnd();
-            }
-            while (getReadOffset(deserializer, enableChecksums) < offsetDeserialized) {
-                KU_ASSERT(!deserializer.finished());
-                auto walRecord = WALRecord::deserialize(deserializer, clientContext);
-                replayWALRecord(*walRecord);
-            }
-            removeFileIfExists(checkpointWalPath);
-        }
-    } catch (const std::exception&) {
-        auto transactionContext = TransactionContext::Get(clientContext);
-        if (transactionContext->hasActiveTransaction()) {
-            transactionContext->rollback();
-        }
-        throw;
-    }
-}
+        validateWALBeforeShadowCleanup(frozenFileInfo.get(), frozenReplayInfo);
+        validateWALBeforeShadowCleanup(activeFileInfo.get(), activeReplayInfo);
 
-void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
-    bool enableChecksums) const {
-    auto fileInfo = openWALFile();
-    if (fileInfo->getFileSize() == 0) {
-        removeFileIfExists(walPath);
-        return;
-    }
-    syncWALFile(*fileInfo);
-
-    try {
-        auto [offsetDeserialized, isLastRecordCheckpoint] =
-            dryReplay(*fileInfo, throwOnWalReplayFailure, enableChecksums);
-        if (isLastRecordCheckpoint) {
-            ShadowFile::replayShadowPageRecords(clientContext);
+        if (activeReplayInfo.isLastRecordCheckpoint) {
+            if (frozenReplayInfo.isLastRecordCheckpoint) {
+                throw RuntimeException("Both the active and checkpoint WAL files end with a "
+                                       "checkpoint record.");
+            }
+            if (frozenReplayInfo.checkpointID.has_value()) {
+                throw RuntimeException(
+                    "Active checkpoint marker follows an incomplete frozen checkpoint.");
+            }
+            verifyWALDatabaseID(clientContext, *activeFileInfo, activeReplayInfo.databaseID);
+            frozenFileInfo.reset();
+            replayShadowPagesIfPresent(activeReplayInfo);
+            activeFileInfo.reset();
+            removeFileIfExists(checkpointWalPath);
             removeWALAndShadowFiles();
             checkpointer.readCheckpoint();
+            return;
+        }
+
+        bool replayedFrozenWAL = false;
+        if (frozenFileInfo) {
+            if (frozenFileInfo->getFileSize() == 0 || frozenReplayInfo.offsetDeserialized == 0) {
+                frozenFileInfo.reset();
+                rollbackShadowCheckpoint();
+                removeFileIfExists(checkpointWalPath);
+                removeFileIfExists(shadowFilePath);
+                checkpointer.readCheckpoint();
+            } else if (frozenReplayInfo.isLastRecordCheckpoint) {
+                verifyWALDatabaseID(clientContext, *frozenFileInfo, frozenReplayInfo.databaseID);
+                replayShadowPagesIfPresent(frozenReplayInfo);
+                frozenFileInfo.reset();
+                removeFileIfExists(shadowFilePath);
+                removeFileIfExists(checkpointWalPath);
+                checkpointer.readCheckpoint();
+            } else {
+                const auto rollbackCheckpoint = frozenReplayInfo.checkpointID.has_value();
+                rollbackShadowCheckpoint();
+                removeFileIfExists(shadowFilePath);
+                checkpointer.readCheckpoint();
+                if (rollbackCheckpoint) {
+                    truncateWALFile(*frozenFileInfo, frozenReplayInfo.offsetDeserialized);
+                }
+                replayWALFile(*frozenFileInfo, frozenReplayInfo, enableChecksums);
+                if (!rollbackCheckpoint) {
+                    truncateWALFile(*frozenFileInfo, frozenReplayInfo.offsetDeserialized);
+                }
+                replayedFrozenWAL = true;
+            }
         } else {
-            Deserializer deserializer = initDeserializer(*fileInfo, clientContext, enableChecksums);
-            if (offsetDeserialized > 0) {
-                deserializer.getReader()->onObjectBegin();
-                const auto walHeader = readWALHeader(deserializer);
-                FileDBIDUtils::verifyDatabaseID(*fileInfo,
-                    StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
-                    walHeader.databaseID);
-                deserializer.getReader()->onObjectEnd();
+            rollbackShadowCheckpoint();
+            removeFileIfExists(shadowFilePath);
+            checkpointer.readCheckpoint();
+        }
+
+        if (activeFileInfo) {
+            if (activeFileInfo->getFileSize() == 0) {
+                activeFileInfo.reset();
+                removeFileIfExists(walPath);
+            } else {
+                const auto rollbackCheckpoint = activeReplayInfo.checkpointID.has_value();
+                if (rollbackCheckpoint) {
+                    truncateWALFile(*activeFileInfo, activeReplayInfo.offsetDeserialized);
+                    if (activeReplayInfo.offsetDeserialized == 0) {
+                        activeFileInfo.reset();
+                        removeFileIfExists(walPath);
+                    } else {
+                        replayWALFile(*activeFileInfo, activeReplayInfo, enableChecksums);
+                    }
+                } else {
+                    replayWALFile(*activeFileInfo, activeReplayInfo, enableChecksums);
+                    truncateWALFile(*activeFileInfo, activeReplayInfo.offsetDeserialized);
+                }
             }
-            while (getReadOffset(deserializer, enableChecksums) < offsetDeserialized) {
-                KU_ASSERT(!deserializer.finished());
-                auto walRecord = WALRecord::deserialize(deserializer, clientContext);
-                replayWALRecord(*walRecord);
-            }
-            truncateWALFile(*fileInfo, offsetDeserialized);
+        }
+
+        if (replayedFrozenWAL && !StorageManager::Get(clientContext)->isReadOnly()) {
+            frozenFileInfo.reset();
+            activeFileInfo.reset();
+            checkpointer.writeRecoveryCheckpoint();
         }
     } catch (const std::exception&) {
         auto transactionContext = TransactionContext::Get(clientContext);
@@ -195,6 +299,24 @@ void WALReplayer::replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalRep
             transactionContext->rollback();
         }
         throw;
+    }
+}
+
+void WALReplayer::replayWALFile(FileInfo& fileInfo, const WALReplayInfo& replayInfo,
+    bool enableChecksums) const {
+    Deserializer deserializer = initDeserializer(fileInfo, clientContext, enableChecksums);
+    if (replayInfo.offsetDeserialized > 0) {
+        deserializer.getReader()->onObjectBegin();
+        const auto walHeader = readWALHeader(deserializer);
+        FileDBIDUtils::verifyDatabaseID(fileInfo,
+            StorageManager::Get(clientContext)->getOrInitDatabaseID(clientContext),
+            walHeader.databaseID);
+        deserializer.getReader()->onObjectEnd();
+    }
+    while (getReadOffset(deserializer, enableChecksums) < replayInfo.offsetDeserialized) {
+        KU_ASSERT(!deserializer.finished());
+        auto walRecord = WALRecord::deserialize(deserializer, clientContext);
+        replayWALRecord(*walRecord);
     }
 }
 
@@ -202,23 +324,86 @@ WALReplayer::WALReplayInfo WALReplayer::dryReplay(FileInfo& fileInfo, bool throw
     bool enableChecksums) const {
     uint64_t offsetDeserialized = 0;
     bool isLastRecordCheckpoint = false;
+    ku_uuid_t databaseID{0};
+    bool hasHeader = false;
+    std::optional<ku_uuid_t> checkpointID;
+    std::optional<page_idx_t> checkpointStartDataFileNumPages;
+    std::optional<page_idx_t> checkpointEndDataFileNumPages;
+    bool checkpointProtocolFailure = false;
+    WALRecordType encounteredType = WALRecordType::INVALID_RECORD;
     try {
         Deserializer deserializer = initDeserializer(fileInfo, clientContext, enableChecksums);
 
         // Skip the databaseID here, we'll verify it when we actually replay
         deserializer.getReader()->onObjectBegin();
         const auto walHeader = readWALHeader(deserializer);
+        databaseID = walHeader.databaseID;
         checkWALHeader(walHeader, enableChecksums);
         deserializer.getReader()->onObjectEnd();
+        hasHeader = true;
 
         bool finishedDeserializing = deserializer.finished();
         while (!finishedDeserializing) {
-            auto walRecord = WALRecord::deserialize(deserializer, clientContext);
+            encounteredType = WALRecordType::INVALID_RECORD;
+            auto walRecord = WALRecord::deserialize(
+                deserializer, clientContext, &encounteredType);
             finishedDeserializing = deserializer.finished();
+            if (checkpointID.has_value() &&
+                walRecord->type != WALRecordType::CHECKPOINT_RECORD_V2) {
+                checkpointProtocolFailure = true;
+                throw RuntimeException("WAL contains a record after checkpoint begin.");
+            }
             switch (walRecord->type) {
-            case WALRecordType::CHECKPOINT_RECORD: {
-                KU_ASSERT(finishedDeserializing);
-                // If we reach a checkpoint record, we can stop replaying.
+            case WALRecordType::CHECKPOINT_BEGIN_RECORD: {
+                const auto& checkpointBeginRecord = walRecord->cast<CheckpointBeginRecord>();
+                if ((checkpointBeginRecord.checkpointStartDataFileNumPages ^
+                        checkpointBeginRecord.checkpointStartDataFileNumPagesCheck) !=
+                        std::numeric_limits<page_idx_t>::max() ||
+                    checkpointBeginRecord.checkpointStartDataFileNumPages == 0) {
+                    checkpointProtocolFailure = true;
+                    throw RuntimeException("WAL checkpoint begin has an invalid page watermark.");
+                }
+                checkpointID = checkpointBeginRecord.checkpointID;
+                checkpointStartDataFileNumPages =
+                    checkpointBeginRecord.checkpointStartDataFileNumPages;
+            } break;
+            case WALRecordType::CHECKPOINT_RECORD:
+            case WALRecordType::CHECKPOINT_RECORD_V2: {
+                if (!finishedDeserializing) {
+                    checkpointProtocolFailure = true;
+                    throw RuntimeException("WAL checkpoint marker is not the final record.");
+                }
+                if (walRecord->type == WALRecordType::CHECKPOINT_RECORD_V2) {
+                    const auto& checkpointRecord = walRecord->cast<CheckpointRecordV2>();
+                    const auto markerCheckpointID = checkpointRecord.checkpointID;
+                    if (!checkpointID.has_value()) {
+                        checkpointProtocolFailure = true;
+                        throw RuntimeException(
+                            "WAL checkpoint marker has no matching checkpoint begin record.");
+                    }
+                    if (checkpointID->value != markerCheckpointID.value) {
+                        checkpointProtocolFailure = true;
+                        throw RuntimeException("WAL checkpoint identities do not match.");
+                    }
+                    if ((checkpointRecord.checkpointEndDataFileNumPages ^
+                            checkpointRecord.checkpointEndDataFileNumPagesCheck) !=
+                            std::numeric_limits<page_idx_t>::max() ||
+                        checkpointRecord.checkpointEndDataFileNumPages <
+                            *checkpointStartDataFileNumPages ||
+                        static_cast<uint64_t>(checkpointRecord.checkpointEndDataFileNumPages) >
+                            clientContext.getDBConfig()->maxDBSize / KUZU_PAGE_SIZE) {
+                        checkpointProtocolFailure = true;
+                        throw RuntimeException(
+                            "WAL checkpoint marker has invalid data-file page bounds.");
+                    }
+                    checkpointID = markerCheckpointID;
+                    checkpointEndDataFileNumPages =
+                        checkpointRecord.checkpointEndDataFileNumPages;
+                } else if (checkpointID.has_value()) {
+                    checkpointProtocolFailure = true;
+                    throw RuntimeException(
+                        "Legacy checkpoint marker follows an identified checkpoint.");
+                }
                 isLastRecordCheckpoint = true;
                 finishedDeserializing = true;
                 offsetDeserialized = getReadOffset(deserializer, enableChecksums);
@@ -235,11 +420,17 @@ WALReplayer::WALReplayInfo WALReplayer::dryReplay(FileInfo& fileInfo, bool throw
     } catch (...) {
         // If we hit an exception while deserializing, we assume that the WAL file is (partially)
         // corrupted. This should only happen for records of the last transaction recorded.
-        if (throwOnWalReplayFailure) {
+        if (encounteredType == WALRecordType::CHECKPOINT_BEGIN_RECORD ||
+            encounteredType == WALRecordType::CHECKPOINT_RECORD_V2 ||
+            encounteredType == WALRecordType::CHECKPOINT_RECORD) {
+            checkpointProtocolFailure = true;
+        }
+        if (throwOnWalReplayFailure || checkpointProtocolFailure || checkpointID.has_value()) {
             throw;
         }
     }
-    return {offsetDeserialized, isLastRecordCheckpoint};
+    return {offsetDeserialized, isLastRecordCheckpoint, databaseID, hasHeader, checkpointID,
+        checkpointStartDataFileNumPages, checkpointEndDataFileNumPages};
 }
 
 void WALReplayer::replayWALRecord(WALRecord& walRecord) const {
@@ -286,11 +477,14 @@ void WALReplayer::replayWALRecord(WALRecord& walRecord) const {
     case WALRecordType::LOAD_EXTENSION_RECORD: {
         replayLoadExtensionRecord(walRecord);
     } break;
-    case WALRecordType::CHECKPOINT_RECORD: {
+    case WALRecordType::CHECKPOINT_RECORD:
+    case WALRecordType::CHECKPOINT_RECORD_V2: {
         // This record should not be replayed. It is only used to indicate that the previous records
         // had been replayed and shadow files are created.
         KU_UNREACHABLE;
     }
+    case WALRecordType::CHECKPOINT_BEGIN_RECORD: {
+    } break;
     default:
         KU_UNREACHABLE;
     }
@@ -598,19 +792,24 @@ void WALReplayer::removeFileIfExists(const std::string& path) const {
     if (StorageManager::Get(clientContext)->isReadOnly()) {
         return;
     }
+#if !defined(__WASM__)
+    auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
+    vfs->removeFileIfExistsDurably(path);
+#else
     auto vfs = VirtualFileSystem::GetUnsafe(clientContext);
     if (vfs->fileOrPathExists(path, &clientContext)) {
         vfs->removeFileIfExists(path);
     }
+#endif
 }
 
-std::unique_ptr<FileInfo> WALReplayer::openWALFile() const {
+std::unique_ptr<FileInfo> WALReplayer::openWALFile(const std::string& path) const {
     auto flag = FileFlags::READ_ONLY;
     if (!StorageManager::Get(clientContext)->isReadOnly()) {
         flag |= FileFlags::WRITE; // The write flag here is to ensure the file is opened with O_RDWR
                                   // so that we can sync it.
     }
-    return VirtualFileSystem::GetUnsafe(clientContext)->openFile(walPath, FileOpenFlags(flag));
+    return VirtualFileSystem::GetUnsafe(clientContext)->openFile(path, FileOpenFlags(flag));
 }
 
 void WALReplayer::syncWALFile(const FileInfo& fileInfo) const {

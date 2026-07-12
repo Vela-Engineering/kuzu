@@ -25,6 +25,11 @@ struct CSRHeaderColumns {
     std::unique_ptr<Column> length;
 };
 
+struct PreparedRelTableDataCheckpoint {
+    std::vector<common::column_id_t> columnIDs;
+    PreparedNodeGroupCollectionCheckpoint nodeGroups;
+};
+
 class PersistentVersionRecordHandler final : public VersionRecordHandler {
 public:
     explicit PersistentVersionRecordHandler(RelTableData* relTableData);
@@ -97,6 +102,10 @@ public:
     TableStats getStats() const { return nodeGroups->getStats(); }
 
     void reclaimStorage(PageAllocator& pageAllocator) const;
+    PreparedRelTableDataCheckpoint prepareCheckpoint(
+        const std::vector<common::column_id_t>& columnIDs, PageAllocator& pageAllocator,
+        const transaction::Transaction* snapshotTxn = nullptr);
+    void installCheckpoint(PreparedRelTableDataCheckpoint checkpoint, PageAllocator& pageAllocator);
     void checkpoint(const std::vector<common::column_id_t>& columnIDs,
         PageAllocator& pageAllocator,
         const transaction::Transaction* snapshotTxn = nullptr);

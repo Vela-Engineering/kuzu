@@ -494,8 +494,13 @@ bool RelTable::checkpoint(main::ClientContext*, TableCatalogEntry* tableEntry,
     for (auto& property : tableEntry->getProperties()) {
         columnIDs.push_back(tableEntry->getColumnID(property.getName()));
     }
-    for (auto& directedRelData : directedRelData) {
-        directedRelData->checkpoint(columnIDs, pageAllocator, snapshotTxn);
+    std::vector<PreparedRelTableDataCheckpoint> preparedCheckpoints;
+    preparedCheckpoints.reserve(directedRelData.size());
+    for (auto& relData : directedRelData) {
+        preparedCheckpoints.push_back(relData->prepareCheckpoint(columnIDs, pageAllocator, snapshotTxn));
+    }
+    for (auto i = 0u; i < directedRelData.size(); i++) {
+        directedRelData[i]->installCheckpoint(std::move(preparedCheckpoints[i]), pageAllocator);
     }
     lastCheckpointedEpoch = effectiveEpoch;
     return true;
@@ -506,12 +511,12 @@ row_idx_t RelTable::getNumTotalRows(const Transaction* transaction) {
     if (auto localTable = transaction->getLocalStorage()->getLocalTable(tableID)) {
         numLocalRows = localTable->getNumTotalRows();
     }
-    return numLocalRows + nextRelOffset;
+    return numLocalRows + nextRelOffset.load(std::memory_order_relaxed);
 }
 
 void RelTable::serialize(Serializer& ser) const {
     ser.writeDebuggingInfo("next_rel_offset");
-    ser.write<offset_t>(nextRelOffset);
+    ser.write<offset_t>(nextRelOffset.load(std::memory_order_relaxed));
     for (auto& directedRelData : directedRelData) {
         directedRelData->serialize(ser);
     }
@@ -520,7 +525,9 @@ void RelTable::serialize(Serializer& ser) const {
 void RelTable::deserialize(main::ClientContext*, StorageManager*, Deserializer& deSer) {
     std::string key;
     deSer.validateDebuggingInfo(key, "next_rel_offset");
-    deSer.deserializeValue<offset_t>(nextRelOffset);
+    offset_t offset;
+    deSer.deserializeValue<offset_t>(offset);
+    nextRelOffset.store(offset, std::memory_order_relaxed);
     for (auto i = 0u; i < directedRelData.size(); i++) {
         directedRelData[i]->deserialize(deSer, *memoryManager);
     }

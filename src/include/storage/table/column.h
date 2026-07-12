@@ -100,6 +100,9 @@ public:
     virtual std::vector<std::unique_ptr<ColumnChunkData>> checkpointSegment(
         ColumnCheckpointState&& checkpointState, PageAllocator& pageAllocator,
         bool canSplitSegment = true) const;
+    std::vector<std::unique_ptr<ColumnChunkData>> checkpointSegmentOutOfPlace(
+        ColumnCheckpointState&& checkpointState, PageAllocator& pageAllocator,
+        bool canSplitSegment = true) const;
 
 protected:
     // For a scan that includes a selectionVector, the startOffsetInVector should be considered to

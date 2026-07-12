@@ -6,6 +6,7 @@
 
 #include "api_test/api_test.h"
 #include "api_test/private_api_test.h"
+#include "common/exception/io.h"
 #include "main/attached_database.h"
 #include "main/database.h"
 #include "storage/storage_utils.h"
@@ -183,6 +184,75 @@ TEST_F(EmptyDBTransactionTest, GetsAttachedDatabaseTransactionManager) {
     result = conn->query("DETACH remote;");
     ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
     removeParentDirectoryOfDBPath(attachedDatabasePath);
+}
+
+TEST_F(EmptyDBTransactionTest, WALSyncFailureRequiresRestart) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);")->isSuccess());
+    auto activeWriter = std::make_unique<kuzu::main::Connection>(database.get());
+    ASSERT_TRUE(activeWriter->query("BEGIN TRANSACTION;")->isSuccess());
+    ASSERT_TRUE(activeWriter->query("CREATE (:test {id: 3});")->isSuccess());
+    setCommitSyncHook(*database, [] { throw IOException{"injected WAL sync failure"}; });
+
+    auto result = conn->query("CREATE (:test {id: 1});");
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_NE(result->getErrorMessage().find("commit outcome is unknown"), std::string::npos);
+    ASSERT_FALSE(hasActiveTransaction(*conn));
+    ASSERT_TRUE(activeWriter->query("ROLLBACK;")->isSuccess());
+
+    result = conn->query("MATCH (n:test) RETURN count(*);");
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_NE(result->getErrorMessage().find("restarted to recover from a failed commit"),
+        std::string::npos);
+    result = conn->query("CHECKPOINT;");
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_NE(result->getErrorMessage().find("restarted to recover from a failed commit"),
+        std::string::npos);
+
+    activeWriter.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+    result = conn->query("MATCH (n:test) RETURN count(*);");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    const auto count = result->getNext()->getValue(0)->getValue<int64_t>();
+    ASSERT_TRUE(count == 0 || count == 1);
+    result = conn->query("MATCH (n:test) WHERE n.id = 3 RETURN count(*);");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 0);
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 2});")->isSuccess());
+}
+
+TEST_F(EmptyDBTransactionTest, DurableCommitPublicationFailureRequiresRestart) {
+    if (inMemMode) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);")->isSuccess());
+    setCommitPublicationHook(
+        *database, [] { throw IOException{"injected commit publication failure"}; });
+
+    auto result = conn->query("CREATE (:test {id: 1});");
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_NE(result->getErrorMessage().find("commit is durable but could not be published"),
+        std::string::npos);
+    ASSERT_FALSE(hasActiveTransaction(*conn));
+
+    result = conn->query("MATCH (n:test) RETURN count(*);");
+    ASSERT_FALSE(result->isSuccess());
+    ASSERT_NE(result->getErrorMessage().find("restarted to recover from a failed commit"),
+        std::string::npos);
+
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+    result = conn->query("MATCH (n:test) RETURN count(*);");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 2});")->isSuccess());
 }
 
 #ifndef __SINGLE_THREADED__

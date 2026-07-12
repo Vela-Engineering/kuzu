@@ -122,6 +122,73 @@ Catalog exception: Write-write conflict on creating catalog entry with name t.
 -STATEMENT COMMIT;
 ---- ok
 
+-CASE AlterTableWriteWriteConflict
+-STATEMENT CALL experimental_concurrent_writes=true;
+---- ok
+-STATEMENT CREATE NODE TABLE person(id INT64 PRIMARY KEY);
+---- ok
+-CREATE_CONNECTION conn2
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT [conn2] BEGIN TRANSACTION;
+---- ok
+-STATEMENT ALTER TABLE person ADD propA INT64;
+---- ok
+-STATEMENT [conn2] COMMENT ON TABLE person IS 'person information';
+---- error
+Catalog exception: Write-write conflict on altering catalog entry with name person.
+-STATEMENT COMMIT;
+---- ok
+-STATEMENT CALL table_info('person') WHERE name='propA' RETURN name, type;
+---- 1
+propA|INT64
+
+-CASE DropTableWriteWriteConflictDoesNotDangleUndoAnchor
+-STATEMENT CALL experimental_concurrent_writes=true;
+---- ok
+-STATEMENT CREATE NODE TABLE t(id INT64 PRIMARY KEY);
+---- ok
+-CREATE_CONNECTION conn2
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT [conn2] BEGIN TRANSACTION;
+---- ok
+-STATEMENT DROP TABLE t;
+---- ok
+-STATEMENT [conn2] DROP TABLE t;
+---- error
+Catalog exception: Write-write conflict on dropping catalog entry with name t.
+-STATEMENT ROLLBACK;
+---- ok
+-STATEMENT [conn2] ALTER TABLE t ADD name STRING;
+---- ok
+-STATEMENT CALL table_info('t') WHERE name='name' RETURN name, type;
+---- 1
+name|STRING
+
+-CASE RenameTableWriteWriteConflictDoesNotStrandOriginalName
+-STATEMENT CALL experimental_concurrent_writes=true;
+---- ok
+-STATEMENT CREATE NODE TABLE original(id INT64 PRIMARY KEY);
+---- ok
+-CREATE_CONNECTION conn2
+-STATEMENT BEGIN TRANSACTION;
+---- ok
+-STATEMENT [conn2] BEGIN TRANSACTION;
+---- ok
+-STATEMENT [conn2] CREATE NODE TABLE target(id INT64 PRIMARY KEY);
+---- ok
+-STATEMENT ALTER TABLE original RENAME TO target;
+---- error
+Catalog exception: Write-write conflict on creating catalog entry with name target.
+-STATEMENT [conn2] ROLLBACK;
+---- ok
+-STATEMENT ALTER TABLE original ADD name STRING;
+---- ok
+-STATEMENT CALL table_info('original') WHERE name='name' RETURN name, type;
+---- 1
+name|STRING
+
 -CASE ConcurrentWriteAndRead
 -STATEMENT BEGIN TRANSACTION;
 ---- ok

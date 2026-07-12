@@ -8,27 +8,28 @@ namespace kuzu {
 namespace function {
 
 struct FreeSpaceInfoBindData final : TableFuncBindData {
-    const main::ClientContext* ctx;
-    FreeSpaceInfoBindData(binder::expression_vector columns, common::row_idx_t numRows,
-        const main::ClientContext* ctx)
-        : TableFuncBindData{std::move(columns), numRows}, ctx{ctx} {}
+    std::vector<storage::PageRange> entries;
+
+    FreeSpaceInfoBindData(binder::expression_vector columns,
+        std::vector<storage::PageRange> entries)
+        : TableFuncBindData{std::move(columns), entries.size()}, entries{std::move(entries)} {}
 
     std::unique_ptr<TableFuncBindData> copy() const override {
-        return std::make_unique<FreeSpaceInfoBindData>(columns, numRows, ctx);
+        return std::make_unique<FreeSpaceInfoBindData>(columns, entries);
     }
 };
 
 static common::offset_t internalTableFunc(const TableFuncMorsel& morsel,
     const TableFuncInput& input, common::DataChunk& output) {
     const auto bindData = input.bindData->constPtrCast<FreeSpaceInfoBindData>();
-    const auto entries = storage::PageManager::Get(*bindData->ctx)
-                             ->getFreeEntries(morsel.startOffset, morsel.endOffset);
-    for (common::row_idx_t i = 0; i < entries.size(); ++i) {
-        const auto& freeEntry = entries[i];
-        output.getValueVectorMutable(0).setValue<uint64_t>(i, freeEntry.startPageIdx);
-        output.getValueVectorMutable(1).setValue<uint64_t>(i, freeEntry.numPages);
+    common::row_idx_t outputOffset = 0;
+    for (auto entryOffset = morsel.startOffset; entryOffset < morsel.endOffset; ++entryOffset) {
+        const auto& freeEntry = bindData->entries[entryOffset];
+        output.getValueVectorMutable(0).setValue<uint64_t>(outputOffset, freeEntry.startPageIdx);
+        output.getValueVectorMutable(1).setValue<uint64_t>(outputOffset, freeEntry.numPages);
+        ++outputOffset;
     }
-    return entries.size();
+    return outputOffset;
 }
 
 static std::unique_ptr<TableFuncBindData> bindFunc(const main::ClientContext* context,
@@ -39,7 +40,7 @@ static std::unique_ptr<TableFuncBindData> bindFunc(const main::ClientContext* co
     columnTypes.push_back(common::LogicalType::UINT64());
     auto columns = input->binder->createVariables(columnNames, columnTypes);
     return std::make_unique<FreeSpaceInfoBindData>(columns,
-        storage::PageManager::Get(*context)->getNumFreeEntries(), context);
+        storage::PageManager::Get(*context)->getFreeEntries());
 }
 
 function_set FreeSpaceInfoFunction::getFunctionSet() {

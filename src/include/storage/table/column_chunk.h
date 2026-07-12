@@ -302,6 +302,8 @@ public:
 
     void checkpoint(Column& column, std::vector<ChunkCheckpointState>&& chunkCheckpointStates,
         PageAllocator& pageAllocator);
+    std::unique_ptr<ColumnChunk> checkpointOutOfPlace(Column& column,
+        std::vector<ChunkCheckpointState>&& chunkCheckpointStates, PageAllocator& pageAllocator) const;
 
     void write(Column& column, ChunkState& state, common::offset_t dstOffset,
         const ColumnChunkData& dataToWrite, common::offset_t srcOffset, common::length_t numValues);

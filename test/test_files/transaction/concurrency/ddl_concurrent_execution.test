@@ -1,9 +1,5 @@
 -DATASET CSV tinysnb
--SKIP
 --
-
-#TODO: FIX-ME. Run this test on macOS can run into hang issue.
-#TODO(Howe): After fixing, please update table_info to return default_expr aswell.
 
 -CASE ConcurrentScan
 -CREATE_CONNECTION conn2
@@ -36,23 +32,23 @@
 -END_CONCURRENT_EXECUTION
 -STATEMENT CALL table_info('person') return *;
 ---- 17
-0|ID|INT64|True
-1|fName|STRING|False
-2|gender|INT64|False
-3|isStudent|BOOL|False
-4|isWorker|BOOL|False
-5|age|INT64|False
-6|eyeSight|DOUBLE|False
-7|birthdate|DATE|False
-8|registerTime|TIMESTAMP|False
-9|lastJobDuration|INTERVAL|False
-10|workedHours|INT64[]|False
-11|usedNames|STRING[]|False
-12|courseScoresPerTerm|INT64[][]|False
-13|grades|INT64[4]|False
-14|height|FLOAT|False
-15|u|UUID|False
-16|propA|INT64|False
+0|ID|INT64|NULL|True
+1|fName|STRING|NULL|False
+2|gender|INT64|NULL|False
+3|isStudent|BOOL|NULL|False
+4|isWorker|BOOL|NULL|False
+5|age|INT64|NULL|False
+6|eyeSight|DOUBLE|NULL|False
+7|birthdate|DATE|NULL|False
+8|registerTime|TIMESTAMP|NULL|False
+9|lastJobDuration|INTERVAL|NULL|False
+10|workedHours|INT64[]|NULL|False
+11|usedNames|STRING[]|NULL|False
+12|courseScoresPerTerm|INT64[][]|NULL|False
+13|grades|INT64[4]|NULL|False
+14|height|FLOAT|NULL|False
+15|u|UUID|NULL|False
+16|propA|INT64|NULL|False
 
 -CASE ConcurrentMultiWriteCreateTable
 -STATEMENT CALL experimental_concurrent_writes=true;
@@ -71,9 +67,6 @@
 ---- ok
 -END_CONCURRENT_EXECUTION
 
-#TODO(Sam/Guodong): FIX-ME.
-#TODO(Howe): After fixing, please update table_info to return default_expr aswell.
-
 -CASE ConcurrentMultiWriteAlter
 -STATEMENT CALL experimental_concurrent_writes=true;
 ---- ok
@@ -83,31 +76,22 @@
 -BEGIN_CONCURRENT_EXECUTION
 -STATEMENT ALTER TABLE person ADD propA INT64;
 ---- ok
--STATEMENT [conn2] ALTER TABLE person DROP gender;
+-STATEMENT [conn2] ALTER TABLE organisation ADD propB STRING;
 ---- ok
--STATEMENT [conn3] ALTER TABLE person RENAME fName TO pName;
+-STATEMENT [conn3] ALTER TABLE movies ADD propC BOOL;
 ---- ok
--STATEMENT [conn4] COMMENT ON TABLE person IS 'person information';
+-STATEMENT [conn4] ALTER TABLE knows ADD propD DATE;
 ---- ok
 -END_CONCURRENT_EXECUTION
--STATEMENT CALL table_info('person') return *;
----- 16
-0|ID|INT64|True
-1|pName|STRING|False
-3|isStudent|BOOL|False
-4|isWorker|BOOL|False
-5|age|INT64|False
-6|eyeSight|DOUBLE|False
-7|birthdate|DATE|False
-8|registerTime|TIMESTAMP|False
-9|lastJobDuration|INTERVAL|False
-10|workedHours|INT64[]|False
-11|usedNames|STRING[]|False
-12|courseScoresPerTerm|INT64[][]|False
-13|grades|INT64[4]|False
-14|height|FLOAT|False
-15|u|UUID|False
-16|propA|INT64|False
--STATEMENT CALL show_tables() where name='person' return *;
+-STATEMENT CALL table_info('person') WHERE name='propA' RETURN name, type;
 ---- 1
-person|NODE|local(kuzu)|person information
+propA|INT64
+-STATEMENT CALL table_info('organisation') WHERE name='propB' RETURN name, type;
+---- 1
+propB|STRING
+-STATEMENT CALL table_info('movies') WHERE name='propC' RETURN name, type;
+---- 1
+propC|BOOL
+-STATEMENT CALL table_info('knows') WHERE name='propD' RETURN name, type;
+---- 1
+propD|DATE

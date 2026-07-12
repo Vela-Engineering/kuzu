@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <vector>
 
 #include "common/types/types.h"
 #include "storage/free_space_manager.h"
@@ -37,6 +38,8 @@ public:
 
     PageRange allocatePageRange(common::page_idx_t numPages) override;
     void freePageRange(PageRange block) override;
+    void freePageRange(PageRange block, const std::vector<PageRange>& rangesToExclude);
+    bool removeFreePageRange(PageRange block);
     void freeImmediatelyRewritablePageRange(FileHandle* fileHandle, PageRange block);
 
     // The page manager must first allocate space for itself so that its serialized version also
@@ -44,15 +47,15 @@ public:
     // Thus this function also allocates and returns the space for the serialized storage maanger
     common::page_idx_t estimatePagesNeededForSerialize();
     void serialize(common::Serializer& serializer);
-    void deserialize(common::Deserializer& deSer);
+    void deserialize(common::Deserializer& deSer,
+        const std::vector<PageRange>& rangesToExclude);
     void finalizeCheckpoint();
-    void rollbackCheckpoint() { freeSpaceManager->rollbackCheckpoint(); }
+    void rollbackCheckpoint();
 
-    common::row_idx_t getNumFreeEntries() const { return freeSpaceManager->getNumEntries(); }
+    common::row_idx_t getNumFreeEntries() const;
+    std::vector<PageRange> getFreeEntries() const;
     std::vector<PageRange> getFreeEntries(common::row_idx_t startOffset,
-        common::row_idx_t endOffset) const {
-        return freeSpaceManager->getEntries(startOffset, endOffset);
-    }
+        common::row_idx_t endOffset) const;
 
     void clearEvictedBMEntriesIfNeeded(BufferManager* bufferManager);
 
@@ -60,7 +63,7 @@ public:
 
 private:
     std::unique_ptr<FreeSpaceManager> freeSpaceManager;
-    std::mutex mtx;
+    mutable std::mutex mtx;
     FileHandle* fileHandle;
     std::atomic<uint64_t> version;
     uint64_t lastCheckpointVersion = 0;

@@ -24,8 +24,7 @@ std::uint64_t getDbSizeInPagesImpl(main::Connection* conn) {
 
 std::uint64_t getNumFreePagesImpl(main::Connection* conn) {
     auto& pm = *storage::PageManager::Get(*conn->getClientContext());
-    auto numFreeEntries = pm.getNumFreeEntries();
-    auto entries = pm.getFreeEntries(0, numFreeEntries);
+    auto entries = pm.getFreeEntries();
     return std::accumulate(entries.begin(), entries.end(), 0ULL,
         [](std::uint64_t a, const auto& b) { return a + b.numPages; });
 }

@@ -13,6 +13,7 @@
 #include "storage/buffer_manager/buffer_manager.h"
 #include "storage/database_header.h"
 #include "storage/shadow_utils.h"
+#include "storage/page_manager.h"
 #include "storage/storage_manager.h"
 #include "storage/wal/local_wal.h"
 #include "transaction/transaction.h"
@@ -48,7 +49,7 @@ PageRange Checkpointer::serializeCatalogSnapshot(const catalog::Catalog& catalog
 }
 
 PageRange Checkpointer::serializeMetadata(const catalog::Catalog& catalog,
-    StorageManager& storageManager) {
+    StorageManager& storageManager, const std::vector<PageRange>& livePageRanges) {
     auto metadataWriter =
         std::make_shared<common::InMemFileWriter>(*MemoryManager::Get(clientContext));
     common::Serializer metadataSerializer(metadataWriter);
@@ -68,6 +69,10 @@ PageRange Checkpointer::serializeMetadata(const catalog::Catalog& catalog,
     auto pageAllocator = storageManager.getDataFH()->getPageManager();
     const auto allocatedPages = pageAllocator->allocatePageRange(
         metadataWriter->getNumPagesToFlush() + pagesForPageManager);
+    for (const auto& livePageRange : livePageRanges) {
+        pageManager.removeFreePageRange(livePageRange);
+    }
+    pageManager.removeFreePageRange(allocatedPages);
     pageManager.serialize(metadataSerializer);
 
     metadataWriter->flush(allocatedPages, pageAllocator->getDataFH(),
@@ -76,7 +81,7 @@ PageRange Checkpointer::serializeMetadata(const catalog::Catalog& catalog,
 }
 
 PageRange Checkpointer::serializeMetadataSnapshot(const catalog::Catalog& catalog,
-    StorageManager& storageManager) {
+    StorageManager& storageManager, const std::vector<PageRange>& livePageRanges) {
     auto metadataWriter =
         std::make_shared<common::InMemFileWriter>(*MemoryManager::Get(clientContext));
     common::Serializer metadataSerializer(metadataWriter);
@@ -89,6 +94,10 @@ PageRange Checkpointer::serializeMetadataSnapshot(const catalog::Catalog& catalo
     auto pageAllocator = storageManager.getDataFH()->getPageManager();
     const auto allocatedPages = pageAllocator->allocatePageRange(
         metadataWriter->getNumPagesToFlush() + pagesForPageManager);
+    for (const auto& livePageRange : livePageRanges) {
+        pageManager.removeFreePageRange(livePageRange);
+    }
+    pageManager.removeFreePageRange(allocatedPages);
     pageManager.serialize(metadataSerializer);
 
     metadataWriter->flush(allocatedPages, pageAllocator->getDataFH(),
@@ -105,6 +114,12 @@ void Checkpointer::writeCheckpoint() {
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
     auto databaseHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+    auto& shadowFile = storageManager->getShadowFile();
+    checkpointID = shadowFile.beginCheckpoint(
+        clientContext, storageManager->getDataFH()->getNumPages());
+    checkpointBeginWriteStarted = true;
+    storageManager->getWAL().logAndFlushCheckpointStart(&clientContext, checkpointID,
+        shadowFile.getCheckpointStartDataFileNumPages(), walRotated);
     bool hasStorageChanges = checkpointStorage();
     serializeCatalogAndMetadata(databaseHeader, hasStorageChanges);
     writeDatabaseHeader(databaseHeader);
@@ -115,17 +130,71 @@ void Checkpointer::writeCheckpoint() {
     pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
 }
 
+void Checkpointer::writeRecoveryCheckpoint() {
+    if (isInMemory) {
+        return;
+    }
+
+    auto storageManager = StorageManager::Get(clientContext);
+    if (storageManager->isReadOnly()) {
+        return;
+    }
+
+    auto databaseHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+    auto& shadowFile = storageManager->getShadowFile();
+    checkpointID = shadowFile.beginCheckpoint(
+        clientContext, storageManager->getDataFH()->getNumPages());
+    checkpointBeginWriteStarted = true;
+    storageManager->getWAL().logAndFlushCheckpointStart(&clientContext, checkpointID,
+        shadowFile.getCheckpointStartDataFileNumPages(), false);
+    const auto hasStorageChanges = checkpointStorage();
+    serializeCatalogAndMetadata(databaseHeader, hasStorageChanges);
+    writeDatabaseHeader(databaseHeader);
+
+    shadowFile.flushAll(clientContext);
+    auto& wal = storageManager->getWAL();
+    markCheckpointMarkerWriteStarted();
+    wal.logAndFlushCheckpoint(&clientContext, checkpointID);
+    markCheckpointMarkerWritten();
+    markShadowApplicationStarted();
+    shadowFile.applyShadowPages(clientContext);
+
+    catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
+    pageManagerVersionAtCheckpoint = storageManager->getDataFH()->getPageManager()->getVersion();
+    storageManager->finalizeCheckpoint();
+    auto bufferManager = MemoryManager::Get(clientContext)->getBufferManager();
+    bufferManager->removeEvictedCandidates();
+    catalog::Catalog::Get(clientContext)->resetVersion(catalogVersionAtCheckpoint);
+    storageManager->getDataFH()->getPageManager()->resetVersion(pageManagerVersionAtCheckpoint);
+
+    shadowFile.clear(*bufferManager);
+    shadowFile.reset();
+    wal.clearFrozenWAL();
+    wal.reset();
+}
+
 void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
     if (isInMemory) {
         return;
     }
 
     snapshotTS = snapshotTimestamp;
+    shadowApplicationStarted = false;
+    checkpointBeginWriteStarted = false;
+    checkpointMarkerWriteStarted = false;
+    checkpointMarkerWritten = false;
 
     auto storageManager = StorageManager::Get(clientContext);
+    walRotationStarted = true;
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
     checkpointHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+    auto& shadowFile = storageManager->getShadowFile();
+    checkpointID = shadowFile.beginCheckpoint(
+        clientContext, storageManager->getDataFH()->getNumPages());
+    checkpointBeginWriteStarted = true;
+    storageManager->getWAL().logAndFlushCheckpointStart(&clientContext, checkpointID,
+        shadowFile.getCheckpointStartDataFileNumPages(), walRotated);
 
     // Capture versions before any transaction can start after WAL rotation.
     catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
@@ -162,12 +231,18 @@ void Checkpointer::postCheckpointCleanup() {
     catalog::Catalog::Get(clientContext)->resetVersion(catalogVersionAtCheckpoint);
     auto* dataFH = storageManager->getDataFH();
     dataFH->getPageManager()->resetVersion(pageManagerVersionAtCheckpoint);
+    auto& shadowFile = storageManager->getShadowFile();
+    shadowFile.clear(*bufferManager);
+    shadowFile.reset();
     if (walRotated) {
         storageManager->getWAL().clearFrozenWAL();
     } else {
         storageManager->getWAL().reset();
     }
-    storageManager->getShadowFile().reset();
+}
+
+void Checkpointer::retryShadowApplication() {
+    StorageManager::Get(clientContext)->getShadowFile().applyShadowPages(clientContext);
 }
 
 bool Checkpointer::checkpointStorage() {
@@ -182,26 +257,58 @@ bool Checkpointer::checkpointStorage() {
     return storageManager->checkpoint(&clientContext, *pageAllocator);
 }
 
+static PageRange getDatabaseHeaderPageRange() {
+    return {common::StorageConstants::DB_HEADER_PAGE_IDX, 1};
+}
+
+static bool isValidPageRange(const PageRange& pageRange) {
+    return pageRange.startPageIdx != common::INVALID_PAGE_IDX && pageRange.numPages > 0;
+}
+
+static bool removeFreePageRangeIfValid(PageManager& pageManager, PageRange pageRange) {
+    return isValidPageRange(pageRange) && pageManager.removeFreePageRange(pageRange);
+}
+
+static void freePageRangeIfValid(PageManager& pageManager, PageRange pageRange,
+    const std::vector<PageRange>& rangesToExclude) {
+    if (isValidPageRange(pageRange)) {
+        pageManager.freePageRange(pageRange, rangesToExclude);
+    }
+}
+
 void Checkpointer::serializeCatalogAndMetadata(DatabaseHeader& databaseHeader,
     bool storageChanges) {
     const auto storageManager = StorageManager::Get(clientContext);
     const auto catalog = catalog::Catalog::Get(clientContext);
     auto* dataFH = storageManager->getDataFH();
+    auto& pageManager = *dataFH->getPageManager();
     const bool useSnapshot = snapshotTS > 0;
+    const auto oldCatalogPageRange = databaseHeader.catalogPageRange;
+    const auto oldMetadataPageRange = databaseHeader.metadataPageRange;
+    const auto databaseHeaderPageRange = getDatabaseHeaderPageRange();
+    const bool catalogChanged = catalog->changedSinceLastCheckpoint();
+    const bool pageManagerChanged = pageManager.changedSinceLastCheckpoint();
+    bool repairedHeaderFreePages = pageManager.removeFreePageRange(databaseHeaderPageRange);
+    repairedHeaderFreePages =
+        removeFreePageRangeIfValid(pageManager, oldCatalogPageRange) || repairedHeaderFreePages;
+    repairedHeaderFreePages =
+        removeFreePageRangeIfValid(pageManager, oldMetadataPageRange) || repairedHeaderFreePages;
 
-    if (databaseHeader.catalogPageRange.startPageIdx == common::INVALID_PAGE_IDX ||
-        catalog->changedSinceLastCheckpoint()) {
-        databaseHeader.updateCatalogPageRange(*dataFH->getPageManager(),
+    if (oldCatalogPageRange.startPageIdx == common::INVALID_PAGE_IDX || catalogChanged) {
+        databaseHeader.catalogPageRange =
             useSnapshot ? serializeCatalogSnapshot(*catalog, *storageManager) :
-                          serializeCatalog(*catalog, *storageManager));
+                          serializeCatalog(*catalog, *storageManager);
+        freePageRangeIfValid(pageManager, oldCatalogPageRange,
+            {databaseHeaderPageRange, databaseHeader.catalogPageRange, oldMetadataPageRange});
     }
-    if (databaseHeader.metadataPageRange.startPageIdx == common::INVALID_PAGE_IDX ||
-        storageChanges || catalog->changedSinceLastCheckpoint() ||
-        dataFH->getPageManager()->changedSinceLastCheckpoint()) {
-        databaseHeader.freeMetadataPageRange(*dataFH->getPageManager());
+    if (oldMetadataPageRange.startPageIdx == common::INVALID_PAGE_IDX || storageChanges ||
+        catalogChanged || pageManagerChanged || repairedHeaderFreePages) {
+        std::vector<PageRange> livePageRanges = {
+            databaseHeaderPageRange, databaseHeader.catalogPageRange};
+        freePageRangeIfValid(pageManager, oldMetadataPageRange, livePageRanges);
         databaseHeader.metadataPageRange =
-            useSnapshot ? serializeMetadataSnapshot(*catalog, *storageManager) :
-                          serializeMetadata(*catalog, *storageManager);
+            useSnapshot ? serializeMetadataSnapshot(*catalog, *storageManager, livePageRanges) :
+                          serializeMetadata(*catalog, *storageManager, livePageRanges);
     }
 }
 
@@ -230,17 +337,15 @@ void Checkpointer::logCheckpointAndApplyShadowPages(bool walRotated) {
     auto& shadowFile = storageManager->getShadowFile();
     shadowFile.flushAll(clientContext);
     auto wal = WAL::Get(clientContext);
+    markCheckpointMarkerWriteStarted();
     if (walRotated) {
-        wal->logAndFlushCheckpointToFrozen(&clientContext);
+        wal->logAndFlushCheckpointToFrozen(&clientContext, checkpointID);
     } else {
-        wal->logAndFlushCheckpoint(&clientContext);
+        wal->logAndFlushCheckpoint(&clientContext, checkpointID);
     }
+    markCheckpointMarkerWritten();
+    markShadowApplicationStarted();
     shadowFile.applyShadowPages(clientContext);
-    auto bufferManager = MemoryManager::Get(clientContext)->getBufferManager();
-    if (!walRotated) {
-        wal->clear();
-    }
-    shadowFile.clear(*bufferManager);
 }
 
 void Checkpointer::rollback() {
@@ -266,14 +371,19 @@ bool Checkpointer::canAutoCheckpoint(const main::ClientContext& clientContext,
         return false;
     }
     auto wal = WAL::Get(clientContext);
+    if (wal->hasFrozenWAL()) {
+        return false;
+    }
     const auto expectedSize = transaction.getLocalWAL().getSize() + wal->getFileSize();
     return expectedSize > clientContext.getDBConfig()->checkpointThreshold;
 }
 
 void Checkpointer::readCheckpoint() {
     auto storageManager = StorageManager::Get(clientContext);
-    storageManager->initDataFileHandle(common::VirtualFileSystem::GetUnsafe(clientContext),
-        &clientContext);
+    if (!storageManager->getDataFH()) {
+        storageManager->initDataFileHandle(common::VirtualFileSystem::GetUnsafe(clientContext),
+            &clientContext);
+    }
     if (!isInMemory && storageManager->getDataFH()->getNumPages() > 0) {
         readCheckpoint(&clientContext, catalog::Catalog::Get(clientContext), storageManager);
     }
@@ -295,7 +405,9 @@ void Checkpointer::readCheckpoint(main::ClientContext* context, catalog::Catalog
         deSer.getReader()->cast<common::BufferedFileReader>()->resetReadOffset(
             currentHeader->metadataPageRange.startPageIdx * common::KUZU_PAGE_SIZE);
         storageManager->deserialize(context, catalog, deSer);
-        storageManager->getDataFH()->getPageManager()->deserialize(deSer);
+        storageManager->getDataFH()->getPageManager()->deserialize(deSer,
+            {getDatabaseHeaderPageRange(), currentHeader->catalogPageRange,
+                currentHeader->metadataPageRange});
     }
     storageManager->setDatabaseHeader(std::move(currentHeader));
 }

@@ -13,6 +13,11 @@ class Transaction;
 namespace storage {
 class MemoryManager;
 
+struct PreparedNodeGroupCollectionCheckpoint {
+    std::vector<std::unique_ptr<PreparedNodeGroupCheckpointBase>> nodeGroups;
+    std::vector<common::LogicalType> checkpointedTypes;
+};
+
 class NodeGroupCollection {
 public:
     NodeGroupCollection(MemoryManager& mm, const std::vector<common::LogicalType>& types,
@@ -78,6 +83,10 @@ public:
 
     uint64_t getEstimatedMemoryUsage() const;
 
+    PreparedNodeGroupCollectionCheckpoint prepareCheckpoint(MemoryManager& memoryManager,
+        NodeGroupCheckpointState& state);
+    void installCheckpoint(PreparedNodeGroupCollectionCheckpoint checkpoint,
+        PageAllocator& pageAllocator);
     void checkpoint(MemoryManager& memoryManager, NodeGroupCheckpointState& state);
     void reclaimStorage(PageAllocator& pageAllocator) const;
 

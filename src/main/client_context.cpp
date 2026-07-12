@@ -2,6 +2,7 @@
 
 #include "binder/binder.h"
 #include "common/exception/checkpoint.h"
+#include "common/exception/commit.h"
 #include "common/exception/connection.h"
 #include "common/exception/runtime.h"
 #include "common/file_system/virtual_file_system.h"
@@ -586,6 +587,12 @@ void ClientContext::TransactionHelper::runFuncInTransaction(TransactionContext& 
             context.commit();
         }
     } catch (CheckpointException&) {
+        context.clearTransaction();
+        throw;
+    } catch (WALCommitException&) {
+        context.clearTransaction();
+        throw;
+    } catch (FatalCommitException&) {
         context.clearTransaction();
         throw;
     } catch (std::exception&) {

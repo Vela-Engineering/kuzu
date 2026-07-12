@@ -23,7 +23,7 @@ WAL::WAL(const std::string& dbPath, bool readOnly, bool enableChecksums, Virtual
     : walPath{StorageUtils::getWALFilePath(dbPath)},
       checkpointWalPath{StorageUtils::getCheckpointWALFilePath(dbPath)},
       inMemory{main::DBConfig::isDBPathInMemory(dbPath)}, readOnly{readOnly}, vfs{vfs},
-      enableChecksums(enableChecksums) {}
+      enableChecksums(enableChecksums), syncFileCreationOnNextFlush{false} {}
 
 WAL::~WAL() {}
 
@@ -35,13 +35,42 @@ void WAL::logCommittedWAL(LocalWAL& localWAL, main::ClientContext* context) {
     std::unique_lock lck{mtx};
     initWriter(context);
     localWAL.inMemWriter->flush(*serializer->getWriter());
+    flushAndSyncNoLock(true);
+}
+
+void WAL::logAndFlushCheckpointStart(
+    main::ClientContext* context, ku_uuid_t checkpointID,
+    page_idx_t checkpointStartDataFileNumPages, bool frozenWAL) {
+    CheckpointBeginRecord walRecord{checkpointID, checkpointStartDataFileNumPages};
+    if (frozenWAL) {
+        auto frozenFileInfo = vfs->openFile(checkpointWalPath,
+            FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE), context);
+        std::shared_ptr<Writer> writer = std::make_shared<BufferedFileWriter>(*frozenFileInfo);
+        auto& bufferedWriter = writer->cast<BufferedFileWriter>();
+        if (enableChecksums) {
+            writer = std::make_shared<ChecksumWriter>(
+                std::move(writer), *MemoryManager::Get(*context));
+        }
+        Serializer frozenSerializer{std::move(writer)};
+        bufferedWriter.setFileOffset(frozenFileInfo->getFileSize());
+        frozenSerializer.getWriter()->onObjectBegin();
+        walRecord.serialize(frozenSerializer);
+        frozenSerializer.getWriter()->onObjectEnd();
+        frozenSerializer.getWriter()->flush();
+        frozenSerializer.getWriter()->sync();
+        return;
+    }
+    std::unique_lock lck{mtx};
+    initWriter(context);
+    addNewWALRecordNoLock(walRecord);
     flushAndSyncNoLock();
 }
 
-void WAL::logAndFlushCheckpoint(main::ClientContext* context) {
+void WAL::logAndFlushCheckpoint(main::ClientContext* context, ku_uuid_t checkpointID) {
     std::unique_lock lck{mtx};
     initWriter(context);
-    CheckpointRecord walRecord;
+    CheckpointRecordV2 walRecord{
+        checkpointID, StorageManager::Get(*context)->getDataFH()->getNumPages()};
     addNewWALRecordNoLock(walRecord);
     flushAndSyncNoLock();
 }
@@ -64,11 +93,19 @@ bool WAL::rotateForCheckpoint(main::ClientContext* /*context*/) {
         fileInfo.reset();
         serializer.reset();
     }
+#if defined(__WASM__)
     vfs->renameFile(walPath, checkpointWalPath);
+#else
+    vfs->renameFileDurably(walPath, checkpointWalPath);
+#endif
+    if (checkpointRotationHookForTesting) {
+        checkpointRotationHookForTesting();
+    }
     return true;
 }
 
-void WAL::logAndFlushCheckpointToFrozen(main::ClientContext* context) {
+void WAL::logAndFlushCheckpointToFrozen(
+    main::ClientContext* context, ku_uuid_t checkpointID) {
     auto frozenFileInfo = vfs->openFile(checkpointWalPath,
         FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE), context);
 
@@ -80,7 +117,8 @@ void WAL::logAndFlushCheckpointToFrozen(main::ClientContext* context) {
     auto frozenSerializer = std::make_unique<Serializer>(std::move(writer));
     bufferedWriter.setFileOffset(frozenFileInfo->getFileSize());
 
-    CheckpointRecord walRecord;
+    CheckpointRecordV2 walRecord{
+        checkpointID, StorageManager::Get(*context)->getDataFH()->getNumPages()};
     frozenSerializer->getWriter()->onObjectBegin();
     walRecord.serialize(*frozenSerializer);
     frozenSerializer->getWriter()->onObjectEnd();
@@ -89,7 +127,17 @@ void WAL::logAndFlushCheckpointToFrozen(main::ClientContext* context) {
 }
 
 void WAL::clearFrozenWAL() {
+#if defined(__WASM__)
     vfs->removeFileIfExists(checkpointWalPath);
+#else
+    if (!inMemory) {
+        vfs->removeFileIfExistsDurably(checkpointWalPath);
+    }
+#endif
+}
+
+bool WAL::hasFrozenWAL() const {
+    return !inMemory && vfs->fileOrPathExists(checkpointWalPath);
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const): semantically non-const function.
@@ -102,13 +150,38 @@ void WAL::reset() {
     std::unique_lock lck{mtx};
     fileInfo.reset();
     serializer.reset();
+#if defined(__WASM__)
     vfs->removeFileIfExists(walPath);
+#else
+    if (!inMemory) {
+        vfs->removeFileIfExistsDurably(walPath);
+    }
+#endif
 }
 
 // NOLINTNEXTLINE(readability-make-member-function-const): semantically non-const function.
-void WAL::flushAndSyncNoLock() {
+void WAL::flushAndSyncNoLock(bool isCommit) {
     serializer->getWriter()->flush();
+    if (isCommit && commitSyncHookForTesting) {
+        commitSyncHookForTesting();
+    }
     serializer->getWriter()->sync();
+    if (syncFileCreationOnNextFlush) {
+#if !defined(__WASM__)
+        vfs->syncFileCreation(*fileInfo);
+#endif
+        syncFileCreationOnNextFlush = false;
+    }
+}
+
+void WAL::setCommitSyncHookForTesting(std::function<void()> hook) {
+    std::unique_lock lck{mtx};
+    commitSyncHookForTesting = std::move(hook);
+}
+
+void WAL::setCheckpointRotationHookForTesting(std::function<void()> hook) {
+    std::unique_lock lck{mtx};
+    checkpointRotationHookForTesting = std::move(hook);
 }
 
 uint64_t WAL::getFileSize() {
@@ -146,6 +219,7 @@ void WAL::initWriter(main::ClientContext* context) {
     // This is used to ensure that when replaying the WAL matches the database
     if (fileInfo->getFileSize() == 0) {
         writeHeader(*context);
+        syncFileCreationOnNextFlush = true;
     }
 
     // WAL should always be APPEND only. We don't want to overwrite the file as it may still

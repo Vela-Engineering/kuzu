@@ -1,8 +1,13 @@
 #pragma once
 
+#include <functional>
+
 #include "storage/wal/wal_record.h"
 
 namespace kuzu {
+namespace testing {
+class BaseGraphTest;
+} // namespace testing
 namespace common {
 class BufferedFileWriter;
 class VirtualFileSystem;
@@ -11,17 +16,24 @@ class VirtualFileSystem;
 namespace storage {
 class LocalWAL;
 class WAL {
+    friend class testing::BaseGraphTest;
+
 public:
     WAL(const std::string& dbPath, bool readOnly, bool enableChecksums,
         common::VirtualFileSystem* vfs);
     ~WAL();
 
     void logCommittedWAL(LocalWAL& localWAL, main::ClientContext* context);
-    void logAndFlushCheckpoint(main::ClientContext* context);
+    void logAndFlushCheckpointStart(main::ClientContext* context,
+        common::ku_uuid_t checkpointID, common::page_idx_t checkpointStartDataFileNumPages,
+        bool frozenWAL);
+    void logAndFlushCheckpoint(main::ClientContext* context, common::ku_uuid_t checkpointID);
 
     bool rotateForCheckpoint(main::ClientContext* context);
-    void logAndFlushCheckpointToFrozen(main::ClientContext* context);
+    void logAndFlushCheckpointToFrozen(main::ClientContext* context,
+        common::ku_uuid_t checkpointID);
     void clearFrozenWAL();
+    bool hasFrozenWAL() const;
 
     // Clear any buffer in the WAL writer. Also truncate the WAL file to 0 bytes.
     void clear();
@@ -33,9 +45,11 @@ public:
     static WAL* Get(const main::ClientContext& context);
 
 private:
+    void setCommitSyncHookForTesting(std::function<void()> hook);
+    void setCheckpointRotationHookForTesting(std::function<void()> hook);
     void initWriter(main::ClientContext* context);
     void addNewWALRecordNoLock(const WALRecord& walRecord);
-    void flushAndSyncNoLock();
+    void flushAndSyncNoLock(bool isCommit = false);
     void writeHeader(main::ClientContext& context);
 
 private:
@@ -52,6 +66,9 @@ private:
     // writing COMMIT/CHECKPOINT records
     std::unique_ptr<common::Serializer> serializer;
     bool enableChecksums;
+    bool syncFileCreationOnNextFlush;
+    std::function<void()> commitSyncHookForTesting;
+    std::function<void()> checkpointRotationHookForTesting;
 };
 
 } // namespace storage

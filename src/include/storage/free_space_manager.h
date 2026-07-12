@@ -8,6 +8,7 @@
 
 #include <optional>
 #include <set>
+#include <vector>
 
 #include "common/types/types.h"
 namespace kuzu::storage {
@@ -31,11 +32,15 @@ public:
 
     // These pages are not reusable until the end of the next checkpoint
     void addUncheckpointedFreePages(PageRange entry);
+    bool addUncheckpointedFreePages(PageRange entry,
+        const std::vector<PageRange>& rangesToExclude);
+    bool removeFreePages(PageRange entry);
     void rollbackCheckpoint();
 
     common::page_idx_t getMaxNumPagesForSerialization() const;
     void serialize(common::Serializer& serializer) const;
-    void deserialize(common::Deserializer& deSer);
+    bool deserialize(common::Deserializer& deSer, common::page_idx_t maxNumPages,
+        const std::vector<PageRange>& rangesToExclude);
     void finalizeCheckpoint(FileHandle* fileHandle);
 
     common::row_idx_t getNumEntries() const;

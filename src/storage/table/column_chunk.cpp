@@ -330,5 +330,39 @@ void ColumnChunk::checkpoint(Column& column,
     }
 }
 
+std::unique_ptr<ColumnChunk> ColumnChunk::checkpointOutOfPlace(Column& column,
+    std::vector<ChunkCheckpointState>&& chunkCheckpointStates, PageAllocator& pageAllocator) const {
+    offset_t segmentStart = 0;
+    std::vector<std::unique_ptr<ColumnChunkData>> checkpointedSegments;
+    for (size_t i = 0; i < data.size(); i++) {
+        std::vector<SegmentCheckpointState> segmentCheckpointStates;
+        auto& segment = data[i];
+        KU_ASSERT(segment->getResidencyState() == ResidencyState::ON_DISK);
+        for (auto& state : chunkCheckpointStates) {
+            const bool isLastSegment = (i == data.size() - 1);
+            if (state.startRow + state.numRows > segmentStart &&
+                (isLastSegment || state.startRow < segmentStart + segment->getNumValues())) {
+                const auto startOffset = std::max(state.startRow, segmentStart);
+                const auto endOffset = isLastSegment ? state.startRow + state.numRows :
+                                                       std::min(state.startRow + state.numRows,
+                                                           segmentStart + segment->getNumValues());
+
+                const auto startOffsetInSegment = startOffset - segmentStart;
+                const auto startRowInChunk = startOffset - state.startRow;
+                segmentCheckpointStates.push_back({*state.chunkData, startRowInChunk,
+                    startOffsetInSegment, endOffset - startOffset});
+            }
+        }
+        auto segmentEnd = segmentStart + segment->getNumValues();
+        auto newSegments = column.checkpointSegmentOutOfPlace(
+            ColumnCheckpointState(*segment, std::move(segmentCheckpointStates)), pageAllocator);
+        for (auto& newSegment : newSegments) {
+            checkpointedSegments.push_back(std::move(newSegment));
+        }
+        segmentStart = segmentEnd;
+    }
+    return std::make_unique<ColumnChunk>(enableCompression, std::move(checkpointedSegments));
+}
+
 } // namespace storage
 } // namespace kuzu

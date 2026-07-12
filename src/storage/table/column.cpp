@@ -476,6 +476,34 @@ std::vector<std::unique_ptr<ColumnChunkData>> Column::checkpointColumnChunkOutOf
     return {};
 }
 
+std::vector<std::unique_ptr<ColumnChunkData>> Column::checkpointSegmentOutOfPlace(
+    ColumnCheckpointState&& checkpointState, PageAllocator& pageAllocator,
+    bool canSplitSegment) const {
+    SegmentState chunkState;
+    checkpointState.persistentData.initializeScanState(chunkState, this);
+    const auto numRows = std::max(checkpointState.endRowIdxToWrite, chunkState.metadata.numValues);
+    auto checkpointedData = ColumnChunkFactory::createColumnChunkData(*mm, dataType.copy(),
+        enableCompression, numRows, ResidencyState::IN_MEMORY);
+    scanSegment(chunkState, checkpointedData.get(), 0, chunkState.metadata.numValues);
+    for (auto& segmentCheckpointState : checkpointState.segmentCheckpointStates) {
+        checkpointedData->write(&segmentCheckpointState.chunkData,
+            segmentCheckpointState.startRowInData, segmentCheckpointState.offsetInSegment,
+            segmentCheckpointState.numRows);
+    }
+    checkpointedData->finalize();
+    if (canSplitSegment && checkpointedData->shouldSplit()) {
+        auto newSegments = checkpointedData->split();
+        for (auto& segment : newSegments) {
+            segment->flush(pageAllocator);
+        }
+        return newSegments;
+    }
+    checkpointedData->flush(pageAllocator);
+    std::vector<std::unique_ptr<ColumnChunkData>> newSegments;
+    newSegments.push_back(std::move(checkpointedData));
+    return newSegments;
+}
+
 bool Column::canCheckpointInPlace(const SegmentState& state,
     const ColumnCheckpointState& checkpointState) const {
     if (isEndOffsetOutOfPagesCapacity(checkpointState.persistentData.getMetadata(),

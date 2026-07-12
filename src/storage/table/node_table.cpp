@@ -590,8 +590,12 @@ bool NodeTable::delete_(Transaction* transaction, TableDeleteState& deleteState)
 void NodeTable::addColumn(Transaction* transaction, TableAddColumnState& addColumnState,
     PageAllocator& pageAllocator) {
     auto& definition = addColumnState.propertyDefinition;
-    columns.push_back(ColumnFactory::createColumn(definition.getName(), definition.getType().copy(),
-        pageAllocator.getDataFH(), memoryManager, shadowFile, enableCompression));
+    auto column = ColumnFactory::createColumn(definition.getName(), definition.getType().copy(),
+        pageAllocator.getDataFH(), memoryManager, shadowFile, enableCompression);
+    {
+        std::unique_lock schemaLck{schemaMtx};
+        columns.push_back(std::move(column));
+    }
     LocalTable* localTable = nullptr;
     if (transaction->getLocalStorage()) {
         localTable = transaction->getLocalStorage()->getLocalTable(tableID);
@@ -612,6 +616,7 @@ std::pair<offset_t, offset_t> NodeTable::appendToLastNodeGroup(Transaction* tran
 }
 
 DataChunk NodeTable::constructDataChunkForColumns(const std::vector<column_id_t>& columnIDs) const {
+    std::shared_lock schemaLck{schemaMtx};
     std::vector<LogicalType> types;
     for (const auto& columnID : columnIDs) {
         KU_ASSERT(columnID < columns.size());
@@ -714,26 +719,32 @@ bool NodeTable::checkpoint(main::ClientContext* context, TableCatalogEntry* tabl
     if (effectiveEpoch <= lastCheckpointedEpoch) {
         return false;
     }
-    // Build column IDs and pointers under unique_lock to protect from concurrent readers.
     std::vector<column_id_t> columnIDs;
     std::vector<Column*> checkpointColumnPtrs;
+    for (auto& property : tableEntry->getProperties()) {
+        columnIDs.push_back(tableEntry->getColumnID(property.getName()));
+    }
     {
-        std::unique_lock schemaLck{schemaMtx};
-        std::vector<std::unique_ptr<Column>> checkpointColumns;
-        for (auto& property : tableEntry->getProperties()) {
-            auto columnID = tableEntry->getColumnID(property.getName());
-            checkpointColumns.push_back(std::move(columns[columnID]));
-            columnIDs.push_back(columnID);
-        }
-        columns = std::move(checkpointColumns);
-        for (const auto& column : columns) {
-            checkpointColumnPtrs.push_back(column.get());
+        std::shared_lock schemaLck{schemaMtx};
+        checkpointColumnPtrs.reserve(columnIDs.size());
+        for (const auto columnID : columnIDs) {
+            checkpointColumnPtrs.push_back(columns[columnID].get());
         }
     }
 
     NodeGroupCheckpointState state{columnIDs, std::move(checkpointColumnPtrs), pageAllocator,
         memoryManager, snapshotTxn};
-    nodeGroups->checkpoint(*memoryManager, state);
+    auto preparedNodeGroups = nodeGroups->prepareCheckpoint(*memoryManager, state);
+    {
+        std::unique_lock schemaLck{schemaMtx};
+        std::vector<std::unique_ptr<Column>> checkpointColumns;
+        checkpointColumns.reserve(columnIDs.size());
+        for (const auto columnID : columnIDs) {
+            checkpointColumns.push_back(std::move(columns[columnID]));
+        }
+        columns = std::move(checkpointColumns);
+    }
+    nodeGroups->installCheckpoint(std::move(preparedNodeGroups), pageAllocator);
     for (auto& index : indexes) {
         index.checkpoint(context, pageAllocator);
     }

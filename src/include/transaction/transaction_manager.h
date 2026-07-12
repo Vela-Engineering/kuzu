@@ -21,6 +21,7 @@ class Database;
 } // namespace main
 
 namespace testing {
+class BaseGraphTest;
 class DBTest;
 class FlakyBufferManager;
 class FlakyCheckpointer;
@@ -29,6 +30,7 @@ class FlakyCheckpointer;
 namespace transaction {
 
 class TransactionManager {
+    friend class testing::BaseGraphTest;
     friend class testing::DBTest;
     friend class testing::FlakyBufferManager;
     friend class testing::FlakyCheckpointer;
@@ -85,6 +87,7 @@ private:
 
     void clearTransactionNoLock(common::transaction_t transactionID);
     void setInitCheckpointerFuncForTesting(init_checkpointer_func_t initFunc);
+    void setCommitPublicationHookForTesting(std::function<void()> hook);
 
 private:
     storage::WAL& wal;
@@ -110,6 +113,9 @@ private:
     bool autoCheckpointRequested = false;
     bool stopAutoCheckpointWorker = false;
     std::string lastAutoCheckpointErrorMessage;
+    bool checkpointRecoveryRequired = false;
+    bool commitRecoveryRequired = false;
+    std::function<void()> commitPublicationHookForTesting;
 
     std::mutex mtxForInitCheckpointerFunc;
     init_checkpointer_func_t initCheckpointerFunc;

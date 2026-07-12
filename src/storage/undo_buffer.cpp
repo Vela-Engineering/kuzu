@@ -197,7 +197,9 @@ void UndoBuffer::commitRecord(UndoRecordType recordType, const uint8_t* record,
 }
 
 void UndoBuffer::commitCatalogEntryRecord(const uint8_t* record, const transaction_t commitTS) {
-    const auto& [_, catalogEntry] = *reinterpret_cast<CatalogEntryRecord const*>(record);
+    const auto& [catalogSet, catalogEntry] =
+        *reinterpret_cast<CatalogEntryRecord const*>(record);
+    std::unique_lock lck{catalogSet->mtx};
     const auto newCatalogEntry = catalogEntry->getNext();
     KU_ASSERT(newCatalogEntry);
     newCatalogEntry->setTimestamp(commitTS);
@@ -252,6 +254,7 @@ void UndoBuffer::rollbackRecord(ClientContext* context, const UndoRecordType rec
 
 void UndoBuffer::rollbackCatalogEntryRecord(const uint8_t* record) {
     const auto& [catalogSet, catalogEntry] = *reinterpret_cast<CatalogEntryRecord const*>(record);
+    std::unique_lock lck{catalogSet->mtx};
     const auto entryToRollback = catalogEntry->getNext();
     KU_ASSERT(entryToRollback);
     if (entryToRollback->getNext()) {

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "storage/wal/wal_record.h"
 
 namespace kuzu {
@@ -19,6 +21,11 @@ private:
     struct WALReplayInfo {
         uint64_t offsetDeserialized = 0;
         bool isLastRecordCheckpoint = false;
+        common::ku_uuid_t databaseID{0};
+        bool hasHeader = false;
+        std::optional<common::ku_uuid_t> checkpointID;
+        std::optional<common::page_idx_t> checkpointStartDataFileNumPages;
+        std::optional<common::page_idx_t> checkpointEndDataFileNumPages;
     };
 
     void replayWALRecord(WALRecord& walRecord) const;
@@ -47,13 +54,11 @@ private:
     void removeWALAndShadowFiles() const;
     void removeFileIfExists(const std::string& path) const;
 
-    std::unique_ptr<common::FileInfo> openWALFile() const;
+    std::unique_ptr<common::FileInfo> openWALFile(const std::string& path) const;
     void syncWALFile(const common::FileInfo& fileInfo) const;
     void truncateWALFile(common::FileInfo& fileInfo, uint64_t size) const;
 
-    void replayFrozenWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
-        bool enableChecksums) const;
-    void replayActiveWAL(Checkpointer& checkpointer, bool throwOnWalReplayFailure,
+    void replayWALFile(common::FileInfo& fileInfo, const WALReplayInfo& replayInfo,
         bool enableChecksums) const;
 
 private:

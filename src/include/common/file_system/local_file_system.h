@@ -25,7 +25,7 @@ struct LocalFileInfo final : FileInfo {
 #endif
 };
 
-class KUZU_API LocalFileSystem final : public FileSystem {
+class KUZU_API LocalFileSystem final : public FileSystem, public DurableFileSystem {
 public:
     explicit LocalFileSystem(std::string homeDir) : FileSystem(std::move(homeDir)) {}
 
@@ -39,6 +39,8 @@ public:
 
     void renameFile(const std::string& from, const std::string& to) override;
 
+    void renameFileDurably(const std::string& from, const std::string& to) override;
+
     void copyFile(const std::string& from, const std::string& to) override;
 
     void createDir(const std::string& dir) const override;
@@ -46,11 +48,18 @@ public:
     void removeFileIfExists(const std::string& path,
         const main::ClientContext* context = nullptr) override;
 
+    void removeFileIfExistsDurably(const std::string& path,
+        const main::ClientContext* context = nullptr) override;
+
     bool fileOrPathExists(const std::string& path, main::ClientContext* context = nullptr) override;
 
     std::string expandPath(main::ClientContext* context, const std::string& path) const override;
 
     void syncFile(const FileInfo& fileInfo) const override;
+
+    void syncFileCreation(const FileInfo& fileInfo) const override;
+
+    void syncParentDirectory(const std::string& path) const override;
 
     static bool isLocalPath(const std::string& path);
 
