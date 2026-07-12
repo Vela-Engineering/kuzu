@@ -48,6 +48,8 @@ public:
     void rollback();
     bool wasWalRotated() const { return walRotated; }
     bool wasShadowApplicationStarted() const { return shadowApplicationStarted; }
+    bool wasCheckpointBeginWriteStarted() const { return checkpointBeginWriteStarted; }
+    bool wasCheckpointMarkerWriteStarted() const { return checkpointMarkerWriteStarted; }
 
     void readCheckpoint();
 
@@ -61,6 +63,7 @@ protected:
     virtual void writeDatabaseHeader(const DatabaseHeader& header);
     virtual void logCheckpointAndApplyShadowPages(bool walRotated);
     void markShadowApplicationStarted() { shadowApplicationStarted = true; }
+    void markCheckpointMarkerWriteStarted() { checkpointMarkerWriteStarted = true; }
 
 private:
     static void readCheckpoint(main::ClientContext* context, catalog::Catalog* catalog,
@@ -80,6 +83,9 @@ protected:
     bool isInMemory;
     bool walRotated = false;
     bool shadowApplicationStarted = false;
+    bool checkpointBeginWriteStarted = false;
+    bool checkpointMarkerWriteStarted = false;
+    common::ku_uuid_t checkpointID{0};
     // Snapshot timestamp captured at drain time for MVCC catalog serialization.
     common::transaction_t snapshotTS = 0;
     // Database header captured during beginCheckpoint for use in finishCheckpoint.

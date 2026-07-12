@@ -38,6 +38,8 @@ enum class WALRecordType : uint8_t {
 
     LOAD_EXTENSION_RECORD = 100,
 
+    CHECKPOINT_BEGIN_RECORD = 252,
+    CHECKPOINT_RECORD_V2 = 253,
     CHECKPOINT_RECORD = 254,
 };
 
@@ -56,7 +58,8 @@ struct WALRecord {
 
     virtual void serialize(common::Serializer& serializer) const;
     static std::unique_ptr<WALRecord> deserialize(common::Deserializer& deserializer,
-        const main::ClientContext& clientContext);
+        const main::ClientContext& clientContext,
+        WALRecordType* encounteredType = nullptr);
 
     template<class TARGET>
     const TARGET& constCast() const {
@@ -87,6 +90,40 @@ struct CheckpointRecord final : WALRecord {
 
     void serialize(common::Serializer& serializer) const override;
     static std::unique_ptr<CheckpointRecord> deserialize(common::Deserializer& deserializer);
+};
+
+struct CheckpointRecordV2 final : WALRecord {
+    common::ku_uuid_t checkpointID{0};
+    common::page_idx_t checkpointEndDataFileNumPages = common::INVALID_PAGE_IDX;
+    common::page_idx_t checkpointEndDataFileNumPagesCheck = common::INVALID_PAGE_IDX;
+
+    CheckpointRecordV2() : WALRecord{WALRecordType::CHECKPOINT_RECORD_V2} {}
+    CheckpointRecordV2(
+        common::ku_uuid_t checkpointID, common::page_idx_t checkpointEndDataFileNumPages)
+        : WALRecord{WALRecordType::CHECKPOINT_RECORD_V2}, checkpointID{checkpointID},
+          checkpointEndDataFileNumPages{checkpointEndDataFileNumPages},
+          checkpointEndDataFileNumPagesCheck{~checkpointEndDataFileNumPages} {}
+
+    void serialize(common::Serializer& serializer) const override;
+    static std::unique_ptr<CheckpointRecordV2> deserialize(
+        common::Deserializer& deserializer);
+};
+
+struct CheckpointBeginRecord final : WALRecord {
+    common::ku_uuid_t checkpointID{0};
+    common::page_idx_t checkpointStartDataFileNumPages = common::INVALID_PAGE_IDX;
+    common::page_idx_t checkpointStartDataFileNumPagesCheck = common::INVALID_PAGE_IDX;
+
+    CheckpointBeginRecord() : WALRecord{WALRecordType::CHECKPOINT_BEGIN_RECORD} {}
+    CheckpointBeginRecord(
+        common::ku_uuid_t checkpointID, common::page_idx_t checkpointStartDataFileNumPages)
+        : WALRecord{WALRecordType::CHECKPOINT_BEGIN_RECORD}, checkpointID{checkpointID},
+          checkpointStartDataFileNumPages{checkpointStartDataFileNumPages},
+          checkpointStartDataFileNumPagesCheck{~checkpointStartDataFileNumPages} {}
+
+    void serialize(common::Serializer& serializer) const override;
+    static std::unique_ptr<CheckpointBeginRecord> deserialize(
+        common::Deserializer& deserializer);
 };
 
 struct CreateCatalogEntryRecord final : WALRecord {

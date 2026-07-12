@@ -6,11 +6,16 @@
 
 #include "api_test/private_api_test.h"
 #include "common/exception/runtime.h"
+#include "common/file_system/virtual_file_system.h"
+#include "common/serializer/buffered_file.h"
+#include "common/serializer/serializer.h"
 #include "main/connection.h"
 #include "storage/buffer_manager/memory_manager.h"
 #include "storage/checkpointer.h"
+#include "storage/file_db_id_utils.h"
 #include "storage/storage_manager.h"
 #include "storage/wal/wal.h"
+#include "test_runner/fsm_leak_checker.h"
 #include "transaction/transaction_manager.h"
 
 using namespace kuzu::common;
@@ -154,6 +159,145 @@ private:
 class FlakyCheckpointerTest : public PrivateApiTest {
 public:
     std::string getInputDir() override { return "empty"; }
+
+    ShadowFileHeader readShadowHeader() const {
+        const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+        std::ifstream shadowFile(shadowFilePath, std::ios::binary);
+        EXPECT_TRUE(shadowFile.is_open());
+        ShadowFileHeader header{};
+        shadowFile.read(reinterpret_cast<char*>(&header), sizeof(header));
+        EXPECT_TRUE(shadowFile.good());
+        return header;
+    }
+
+    void writeShadowHeader(const ShadowFileHeader& header) const {
+        const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+        std::fstream shadowFile(shadowFilePath, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(shadowFile.is_open());
+        shadowFile.seekp(0);
+        shadowFile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        shadowFile.flush();
+        ASSERT_TRUE(shadowFile.good());
+    }
+
+    ShadowPageRecord readShadowRecord(uint64_t recordIdx) const {
+        const auto header = readShadowHeader();
+        EXPECT_LT(recordIdx, header.numShadowPages);
+        const auto recordOffset =
+            (static_cast<uint64_t>(header.numShadowPages) + 1) * KUZU_PAGE_SIZE +
+            sizeof(uint64_t) +
+            recordIdx * (sizeof(file_idx_t) + 2 * sizeof(page_idx_t));
+        const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+        std::ifstream shadowFile(shadowFilePath, std::ios::binary);
+        EXPECT_TRUE(shadowFile.is_open());
+        shadowFile.seekg(recordOffset);
+        ShadowPageRecord record;
+        shadowFile.read(reinterpret_cast<char*>(&record.originalFileIdx), sizeof(file_idx_t));
+        shadowFile.read(reinterpret_cast<char*>(&record.originalPageIdx), sizeof(page_idx_t));
+        shadowFile.read(reinterpret_cast<char*>(&record.shadowPageIdx), sizeof(page_idx_t));
+        EXPECT_TRUE(shadowFile.good());
+        return record;
+    }
+
+    void writeShadowRecord(uint64_t recordIdx, const ShadowPageRecord& record) const {
+        const auto header = readShadowHeader();
+        ASSERT_LT(recordIdx, header.numShadowPages);
+        const auto recordOffset =
+            (static_cast<uint64_t>(header.numShadowPages) + 1) * KUZU_PAGE_SIZE +
+            sizeof(uint64_t) +
+            recordIdx * (sizeof(file_idx_t) + 2 * sizeof(page_idx_t));
+        const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+        std::fstream shadowFile(shadowFilePath, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(shadowFile.is_open());
+        shadowFile.seekp(recordOffset);
+        shadowFile.write(
+            reinterpret_cast<const char*>(&record.originalFileIdx), sizeof(file_idx_t));
+        shadowFile.write(
+            reinterpret_cast<const char*>(&record.originalPageIdx), sizeof(page_idx_t));
+        shadowFile.write(
+            reinterpret_cast<const char*>(&record.shadowPageIdx), sizeof(page_idx_t));
+        shadowFile.flush();
+        ASSERT_TRUE(shadowFile.good());
+    }
+
+    std::string readDataFile() const {
+        std::ifstream dataFile(databasePath, std::ios::binary);
+        EXPECT_TRUE(dataFile.is_open());
+        return {std::istreambuf_iterator<char>{dataFile}, std::istreambuf_iterator<char>{}};
+    }
+
+    void mutateShadowCheckpointID() const {
+        auto header = readShadowHeader();
+        header.checkpointID.value.low ^= 1;
+        writeShadowHeader(header);
+    }
+
+    void convertShadowToLegacy() const {
+        auto header = readShadowHeader();
+        std::vector<ShadowPageRecord> records;
+        records.reserve(header.numShadowPages);
+        for (uint64_t i = 0; i < header.numShadowPages; i++) {
+            records.push_back(readShadowRecord(i));
+        }
+        std::sort(records.begin(), records.end(),
+            [](const ShadowPageRecord& left, const ShadowPageRecord& right) {
+                return left.shadowPageIdx < right.shadowPageIdx;
+            });
+        header.checkpointPageWatermarkMagic = 0;
+        header.checkpointID = ku_uuid_t{0};
+        header.checkpointStartDataFileNumPages = INVALID_PAGE_IDX;
+        header.checkpointStartDataFileNumPagesCheck = INVALID_PAGE_IDX;
+
+        const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+        std::fstream shadowFile(
+            shadowFilePath, std::ios::binary | std::ios::in | std::ios::out);
+        ASSERT_TRUE(shadowFile.is_open());
+        shadowFile.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        const auto recordsOffset =
+            (static_cast<uint64_t>(header.numShadowPages) + 1) * KUZU_PAGE_SIZE;
+        shadowFile.seekp(recordsOffset);
+        const auto numRecords = static_cast<uint64_t>(records.size());
+        shadowFile.write(reinterpret_cast<const char*>(&numRecords), sizeof(numRecords));
+        for (const auto& record : records) {
+            shadowFile.write(reinterpret_cast<const char*>(&record.originalFileIdx),
+                sizeof(record.originalFileIdx));
+            shadowFile.write(reinterpret_cast<const char*>(&record.originalPageIdx),
+                sizeof(record.originalPageIdx));
+        }
+        shadowFile.flush();
+        ASSERT_TRUE(shadowFile.good());
+        shadowFile.close();
+        std::filesystem::resize_file(shadowFilePath,
+            recordsOffset + sizeof(numRecords) +
+                records.size() * (sizeof(file_idx_t) + sizeof(page_idx_t)));
+    }
+
+    template<typename... RECORDS>
+    void writeCheckpointWAL(const RECORDS&... records) const {
+        auto& context = *getClientContext(*conn);
+        const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+        auto* vfs = VirtualFileSystem::GetUnsafe(context);
+        auto frozenWalFile = vfs->openFile(frozenWalPath,
+            FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE), &context);
+        frozenWalFile->truncate(0);
+        auto writer = std::make_shared<BufferedFileWriter>(*frozenWalFile);
+        Serializer serializer{writer};
+        serializer.getWriter()->onObjectBegin();
+        FileDBIDUtils::writeDatabaseID(serializer,
+            StorageManager::Get(context)->getOrInitDatabaseID(context));
+        serializer.write(false);
+        serializer.getWriter()->onObjectEnd();
+        const auto writeRecord = [&](const WALRecord& record) {
+            serializer.getWriter()->onObjectBegin();
+            record.serialize(serializer);
+            serializer.getWriter()->onObjectEnd();
+        };
+        (writeRecord(records), ...);
+        serializer.getWriter()->flush();
+        serializer.getWriter()->sync();
+    }
+
+    void writeLegacyCheckpointMarker() const { writeCheckpointWAL(CheckpointRecord{}); }
 
     void runFlakyCheckpoint(const FlakyCheckpointer& flakyCheckpointer) {
         conn->query("CALL force_checkpoint_on_close=false;");
@@ -415,6 +559,7 @@ TEST_F(FlakyCheckpointerTest, RecoverFromCheckpointSerializeFailure) {
     };
     FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
     runTest(flakyCheckpointer);
+    FSMLeakChecker::checkForLeakedPages(conn.get());
 }
 
 class FlakyCheckpointerFailsOnWritingHeader final : public Checkpointer {
@@ -493,12 +638,56 @@ public:
         auto& shadowFile = storageManager->getShadowFile();
         shadowFile.flushAll(clientContext);
         auto wal = WAL::Get(clientContext);
+        markCheckpointMarkerWriteStarted();
         if (walRotated) {
-            wal->logAndFlushCheckpointToFrozen(&clientContext);
+            wal->logAndFlushCheckpointToFrozen(&clientContext, checkpointID);
         } else {
-            wal->logAndFlushCheckpoint(&clientContext);
+            wal->logAndFlushCheckpoint(&clientContext, checkpointID);
         }
         throw RuntimeException("checkpoint failed.");
+    }
+};
+
+class FlakyCheckpointerWritesMismatchedCheckpointMarker final : public Checkpointer {
+public:
+    explicit FlakyCheckpointerWritesMismatchedCheckpointMarker(main::ClientContext& context)
+        : Checkpointer(context) {}
+
+    void logCheckpointAndApplyShadowPages(bool walRotated) override {
+        const auto storageManager = StorageManager::Get(clientContext);
+        storageManager->getShadowFile().flushAll(clientContext);
+        auto mismatchedCheckpointID = checkpointID;
+        mismatchedCheckpointID.value.low ^= 1;
+        markCheckpointMarkerWriteStarted();
+        if (walRotated) {
+            WAL::Get(clientContext)->logAndFlushCheckpointToFrozen(
+                &clientContext, mismatchedCheckpointID);
+        } else {
+            WAL::Get(clientContext)->logAndFlushCheckpoint(
+                &clientContext, mismatchedCheckpointID);
+        }
+        throw RuntimeException("checkpoint failed.");
+    }
+};
+
+class RecoveryCheckpointerLeavesActiveMarker final : public Checkpointer {
+public:
+    explicit RecoveryCheckpointerLeavesActiveMarker(main::ClientContext& context)
+        : Checkpointer(context) {}
+
+    void writeActiveCheckpointMarker() {
+        auto storageManager = StorageManager::Get(clientContext);
+        auto databaseHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+        checkpointID = storageManager->getShadowFile().beginCheckpoint(
+            clientContext, storageManager->getDataFH()->getNumPages());
+        storageManager->getWAL().logAndFlushCheckpointStart(&clientContext, checkpointID,
+            storageManager->getShadowFile().getCheckpointStartDataFileNumPages(), false);
+        const auto hasStorageChanges = checkpointStorage();
+        serializeCatalogAndMetadata(databaseHeader, hasStorageChanges);
+        writeDatabaseHeader(databaseHeader);
+        storageManager->getShadowFile().flushAll(clientContext);
+        markCheckpointMarkerWriteStarted();
+        storageManager->getWAL().logAndFlushCheckpoint(&clientContext, checkpointID);
     }
 };
 
@@ -513,7 +702,938 @@ TEST_F(FlakyCheckpointerTest, RecoverFromCheckpointApplyingShadowFailure) {
     runTest(flakyCheckpointer);
 }
 
-TEST_F(FlakyCheckpointerTest, RecoverWriterAfterFailedNonRotatedCheckpoint) {
+TEST_F(FlakyCheckpointerTest, LegacyCheckpointMarkerReplaysLegacyShadow) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    writeLegacyCheckpointMarker();
+    convertShadowToLegacy();
+
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+
+    auto result = conn->query("MATCH (a:test) RETURN COUNT(a);");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 5000);
+}
+
+TEST_F(FlakyCheckpointerTest, LegacyCheckpointMarkerRejectsIdentifiedShadow) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    writeLegacyCheckpointMarker();
+
+    conn.reset();
+    database.reset();
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+}
+
+TEST_F(FlakyCheckpointerTest, LegacyCheckpointMarkerAfterIdentifiedBeginFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    const auto shadowHeader = readShadowHeader();
+    writeCheckpointWAL(CheckpointBeginRecord{
+                           shadowHeader.checkpointID,
+                           shadowHeader.checkpointStartDataFileNumPages,
+                       },
+        CheckpointRecord{});
+
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, LegacyCheckpointMarkerWithoutShadowFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    writeLegacyCheckpointMarker();
+
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    conn.reset();
+    database.reset();
+    std::filesystem::remove(shadowFilePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+}
+
+TEST_F(FlakyCheckpointerTest, CheckpointBeginAndMarkerIDMismatchFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerWritesMismatchedCheckpointMarker>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+}
+
+TEST_F(FlakyCheckpointerTest, AmbiguousCheckpointMarkerFailsWithoutTruncating) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    std::ofstream frozenWal(frozenWalPath, std::ios::binary | std::ios::app);
+    ASSERT_TRUE(frozenWal.is_open());
+    const auto recordType = static_cast<uint8_t>(WALRecordType::CHECKPOINT_RECORD_V2);
+    frozenWal.write(reinterpret_cast<const char*>(&recordType), sizeof(recordType));
+    frozenWal.close();
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_ANY_THROW(createDBAndConn());
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+}
+
+TEST_F(FlakyCheckpointerTest, CheckpointMarkerWithoutBeginFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    const auto shadowHeader = readShadowHeader();
+    const auto checkpointEndDataFileNumPages =
+        StorageManager::Get(*getClientContext(*conn))->getDataFH()->getNumPages();
+    writeCheckpointWAL(
+        CheckpointRecordV2{shadowHeader.checkpointID, checkpointEndDataFileNumPages});
+
+    conn.reset();
+    database.reset();
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, NonterminalCheckpointMarkerFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    const auto shadowHeader = readShadowHeader();
+    const auto checkpointEndDataFileNumPages =
+        StorageManager::Get(*getClientContext(*conn))->getDataFH()->getNumPages();
+    writeCheckpointWAL(CheckpointBeginRecord{
+                           shadowHeader.checkpointID,
+                           shadowHeader.checkpointStartDataFileNumPages,
+                       },
+        CheckpointRecordV2{shadowHeader.checkpointID, checkpointEndDataFileNumPages},
+        CommitRecord{});
+
+    conn.reset();
+    database.reset();
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, DuplicateCheckpointBeginFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    std::ifstream shadowFile(shadowFilePath, std::ios::binary);
+    ASSERT_TRUE(shadowFile.is_open());
+    ShadowFileHeader shadowHeader;
+    shadowFile.read(reinterpret_cast<char*>(&shadowHeader), sizeof(shadowHeader));
+    ASSERT_TRUE(shadowFile.good());
+    shadowFile.close();
+    auto& context = *getClientContext(*conn);
+    WAL::Get(context)->logAndFlushCheckpointStart(&context, shadowHeader.checkpointID,
+        shadowHeader.checkpointStartDataFileNumPages, true);
+
+    conn.reset();
+    database.reset();
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, TruncatedCheckpointBeginFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    const auto shadowHeader = readShadowHeader();
+    writeCheckpointWAL(CheckpointBeginRecord{
+        shadowHeader.checkpointID, shadowHeader.checkpointStartDataFileNumPages});
+
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto completeWalPath = frozenWalPath + ".complete";
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    const auto completeWalSize = std::filesystem::file_size(frozenWalPath);
+    ASSERT_GT(completeWalSize, 17);
+    std::filesystem::copy_file(
+        frozenWalPath, completeWalPath, std::filesystem::copy_options::overwrite_existing);
+    conn.reset();
+    database.reset();
+    systemConfig->throwOnWalReplayFailure = false;
+
+    for (const auto truncatedBytes : {1u, 5u, 9u, 17u}) {
+        std::filesystem::copy_file(
+            completeWalPath, frozenWalPath, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::resize_file(frozenWalPath, completeWalSize - truncatedBytes);
+        EXPECT_THROW(createDBAndConn(), RuntimeException);
+        conn.reset();
+        database.reset();
+        EXPECT_TRUE(std::filesystem::exists(frozenWalPath));
+        EXPECT_TRUE(std::filesystem::exists(shadowFilePath));
+    }
+    std::filesystem::remove(completeWalPath);
+}
+
+TEST_F(FlakyCheckpointerTest, TruncatedCheckpointMarkerWithoutBeginFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    const auto shadowHeader = readShadowHeader();
+    const auto checkpointEndDataFileNumPages =
+        StorageManager::Get(*getClientContext(*conn))->getDataFH()->getNumPages();
+    writeCheckpointWAL(
+        CheckpointRecordV2{shadowHeader.checkpointID, checkpointEndDataFileNumPages});
+
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto completeWalPath = frozenWalPath + ".complete";
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    const auto completeWalSize = std::filesystem::file_size(frozenWalPath);
+    ASSERT_GT(completeWalSize, 32);
+    std::filesystem::copy_file(
+        frozenWalPath, completeWalPath, std::filesystem::copy_options::overwrite_existing);
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    systemConfig->throwOnWalReplayFailure = false;
+
+    for (const auto truncatedBytes : {1u, 5u, 9u, 17u, 32u}) {
+        std::filesystem::copy_file(
+            completeWalPath, frozenWalPath, std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::resize_file(frozenWalPath, completeWalSize - truncatedBytes);
+        EXPECT_THROW(createDBAndConn(), RuntimeException);
+        conn.reset();
+        database.reset();
+        EXPECT_EQ(readDataFile(), dataFileBeforeRecovery);
+        EXPECT_TRUE(std::filesystem::exists(frozenWalPath));
+        EXPECT_TRUE(std::filesystem::exists(shadowFilePath));
+    }
+    std::filesystem::remove(completeWalPath);
+}
+
+TEST_F(FlakyCheckpointerTest, InvalidCheckpointMarkerEndGuardFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    const auto shadowHeader = readShadowHeader();
+    const auto checkpointEndDataFileNumPages =
+        StorageManager::Get(*getClientContext(*conn))->getDataFH()->getNumPages();
+    auto marker = CheckpointRecordV2{shadowHeader.checkpointID, checkpointEndDataFileNumPages};
+    marker.checkpointEndDataFileNumPagesCheck ^= 1;
+    writeCheckpointWAL(CheckpointBeginRecord{
+                           shadowHeader.checkpointID,
+                           shadowHeader.checkpointStartDataFileNumPages,
+                       },
+        marker);
+
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, CheckpointMarkerEndBeforeStartFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn.reset();
+    database.reset();
+    systemConfig->enableChecksums = false;
+    createDBAndConn();
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+    const auto shadowHeader = readShadowHeader();
+    ASSERT_GT(shadowHeader.checkpointStartDataFileNumPages, 0);
+    writeCheckpointWAL(CheckpointBeginRecord{
+                           shadowHeader.checkpointID,
+                           shadowHeader.checkpointStartDataFileNumPages,
+                       },
+        CheckpointRecordV2{
+            shadowHeader.checkpointID, shadowHeader.checkpointStartDataFileNumPages - 1});
+
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    systemConfig->throwOnWalReplayFailure = false;
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, EmptyCheckpointShadowFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    std::filesystem::resize_file(shadowFilePath, 0);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(StorageUtils::getCheckpointWALFilePath(databasePath)));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, InvalidShadowPageCountFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    auto shadowHeader = readShadowHeader();
+    shadowHeader.numShadowPages = INVALID_PAGE_IDX;
+    writeShadowHeader(shadowHeader);
+    conn.reset();
+    database.reset();
+
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, MarkedCheckpointWatermarkMismatchFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+    auto shadowHeader = readShadowHeader();
+    shadowHeader.checkpointStartDataFileNumPages++;
+    shadowHeader.checkpointStartDataFileNumPagesCheck =
+        ~shadowHeader.checkpointStartDataFileNumPages;
+    writeShadowHeader(shadowHeader);
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, MarkedCheckpointInvalidShadowIdentityFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+    auto shadowHeader = readShadowHeader();
+    shadowHeader.checkpointPageWatermarkMagic++;
+    writeShadowHeader(shadowHeader);
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, InvalidLaterShadowFileTargetDoesNotPartiallyReplay) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    ASSERT_GT(readShadowHeader().numShadowPages, 1);
+    auto secondRecord = readShadowRecord(1);
+    secondRecord.originalFileIdx = INVALID_FILE_IDX;
+    writeShadowRecord(1, secondRecord);
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, InvalidLaterShadowPageTargetDoesNotPartiallyReplay) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    ASSERT_GT(readShadowHeader().numShadowPages, 1);
+    auto secondRecord = readShadowRecord(1);
+    secondRecord.originalPageIdx =
+        StorageManager::Get(*getClientContext(*conn))->getDataFH()->getNumPages();
+    writeShadowRecord(1, secondRecord);
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, DuplicateLaterShadowTargetDoesNotPartiallyReplay) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    ASSERT_GT(readShadowHeader().numShadowPages, 1);
+    const auto firstRecord = readShadowRecord(0);
+    writeShadowRecord(1, firstRecord);
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+    ASSERT_FALSE(
+        std::filesystem::exists(StorageUtils::getTmpFilePath(databasePath)));
+}
+
+TEST_F(FlakyCheckpointerTest, DuplicateShadowPageSourceDoesNotPartiallyReplay) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    ASSERT_GT(readShadowHeader().numShadowPages, 1);
+    const auto firstRecord = readShadowRecord(0);
+    auto secondRecord = readShadowRecord(1);
+    secondRecord.shadowPageIdx = firstRecord.shadowPageIdx;
+    writeShadowRecord(1, secondRecord);
+    conn.reset();
+    database.reset();
+    const auto dataFileBeforeRecovery = readDataFile();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(readDataFile(), dataFileBeforeRecovery);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, MarkedCheckpointEndBelowDatabaseFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    const auto checkpointEndDataFileNumPages =
+        StorageManager::Get(*getClientContext(*conn))->getDataFH()->getNumPages();
+    conn.reset();
+    database.reset();
+    const auto expandedDataFileSize =
+        static_cast<uint64_t>(checkpointEndDataFileNumPages + 1) * KUZU_PAGE_SIZE;
+    std::filesystem::resize_file(databasePath, expandedDataFileSize);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), expandedDataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, MarkedCheckpointWatermarkBeyondDatabaseFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query(
+        "CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query(
+        "UNWIND RANGE(0, 5000) AS id CREATE (:test {id: id, name: 'name'});")
+                    ->isSuccess());
+    ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 5001, name: 'name'});")->isSuccess());
+
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    flakyCheckpointer.setCheckpointer(*getClientContext(*conn));
+    ASSERT_FALSE(conn->query("CHECKPOINT;")->isSuccess());
+
+    const auto shadowHeader = readShadowHeader();
+    ASSERT_GT(shadowHeader.checkpointStartDataFileNumPages, 1);
+    conn.reset();
+    database.reset();
+    const auto truncatedDataFileSize =
+        static_cast<uint64_t>(shadowHeader.checkpointStartDataFileNumPages - 1) * KUZU_PAGE_SIZE;
+    std::filesystem::resize_file(databasePath, truncatedDataFileSize);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), truncatedDataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, IdentifiedShadowWithoutWALFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    std::filesystem::remove(activeWalPath);
+    std::filesystem::remove(frozenWalPath);
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+
+    systemConfig->readOnly = true;
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+
+    systemConfig->readOnly = false;
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, HeaderOnlyIdentifiedShadowWithoutWALIsRemoved) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    auto& context = *getClientContext(*conn);
+    auto storageManager = StorageManager::Get(context);
+    const auto checkpointStartDataFileNumPages = storageManager->getDataFH()->getNumPages();
+    storageManager->getShadowFile().beginCheckpoint(
+        context, checkpointStartDataFileNumPages);
+
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    conn.reset();
+    database.reset();
+    std::filesystem::remove(activeWalPath);
+    std::filesystem::remove(frozenWalPath);
+    ASSERT_EQ(std::filesystem::file_size(shadowFilePath), KUZU_PAGE_SIZE);
+    ASSERT_EQ(std::filesystem::file_size(databasePath),
+        static_cast<uint64_t>(checkpointStartDataFileNumPages) * KUZU_PAGE_SIZE);
+
+    createDBAndConn();
+    ASSERT_FALSE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, IdentifiedZeroPageShadowPayloadWithoutWALFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    auto& context = *getClientContext(*conn);
+    auto storageManager = StorageManager::Get(context);
+    storageManager->getShadowFile().beginCheckpoint(
+        context, storageManager->getDataFH()->getNumPages());
+
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    conn.reset();
+    database.reset();
+    std::filesystem::remove(activeWalPath);
+    std::filesystem::remove(frozenWalPath);
+    std::filesystem::resize_file(shadowFilePath, KUZU_PAGE_SIZE + 1);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(shadowFilePath), KUZU_PAGE_SIZE + 1);
+}
+
+TEST_F(FlakyCheckpointerTest, IdentifiedZeroPageShadowBeyondWatermarkWithoutWALFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    auto& context = *getClientContext(*conn);
+    auto storageManager = StorageManager::Get(context);
+    const auto checkpointStartDataFileNumPages = storageManager->getDataFH()->getNumPages();
+    storageManager->getShadowFile().beginCheckpoint(
+        context, checkpointStartDataFileNumPages);
+
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    conn.reset();
+    database.reset();
+    std::filesystem::remove(activeWalPath);
+    std::filesystem::remove(frozenWalPath);
+    const auto expandedDataFileSize =
+        static_cast<uint64_t>(checkpointStartDataFileNumPages + 1) * KUZU_PAGE_SIZE;
+    std::filesystem::resize_file(databasePath, expandedDataFileSize);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), expandedDataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, RecoverFromInterruptedFrozenCheckpointRollbackCleanup) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    const auto shadowHeader = readShadowHeader();
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    conn.reset();
+    database.reset();
+    std::filesystem::resize_file(databasePath,
+        static_cast<uint64_t>(shadowHeader.checkpointStartDataFileNumPages) * KUZU_PAGE_SIZE);
+    std::filesystem::remove(shadowFilePath);
+
+    createDBAndConn();
+    auto result = conn->query("MATCH (n:test) RETURN COUNT(n);");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 5000);
+    ASSERT_FALSE(std::filesystem::exists(frozenWalPath));
+}
+
+TEST_F(FlakyCheckpointerTest, RecoverFromInterruptedActiveCheckpointRollbackCleanup) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 1});")->isSuccess());
+
+    auto& context = *getClientContext(*conn);
+    auto storageManager = StorageManager::Get(context);
+    const auto checkpointStartDataFileNumPages = storageManager->getDataFH()->getNumPages();
+    const auto checkpointID = storageManager->getShadowFile().beginCheckpoint(
+        context, checkpointStartDataFileNumPages);
+    storageManager->getWAL().logAndFlushCheckpointStart(
+        &context, checkpointID, checkpointStartDataFileNumPages, false);
+
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    conn.reset();
+    database.reset();
+    ASSERT_EQ(std::filesystem::file_size(databasePath),
+        static_cast<uint64_t>(checkpointStartDataFileNumPages) * KUZU_PAGE_SIZE);
+    std::filesystem::remove(shadowFilePath);
+
+    createDBAndConn();
+    auto result = conn->query("MATCH (n:test) RETURN n.id;");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNumTuples(), 1);
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
+    ASSERT_TRUE(std::filesystem::exists(activeWalPath));
+}
+
+TEST_F(FlakyCheckpointerTest, CheckpointBeginRequiresIdentifiedShadow) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    const auto shadowHeader = readShadowHeader();
+    conn.reset();
+    database.reset();
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    const auto movedShadowFilePath = shadowFilePath + ".moved";
+
+    std::filesystem::rename(shadowFilePath, movedShadowFilePath);
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    conn.reset();
+    database.reset();
+    EXPECT_TRUE(std::filesystem::exists(frozenWalPath));
+    std::filesystem::rename(movedShadowFilePath, shadowFilePath);
+
+    auto legacyShadowHeader = shadowHeader;
+    legacyShadowHeader.checkpointPageWatermarkMagic = 0;
+    writeShadowHeader(legacyShadowHeader);
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    conn.reset();
+    database.reset();
+    EXPECT_TRUE(std::filesystem::exists(frozenWalPath));
+    EXPECT_TRUE(std::filesystem::exists(shadowFilePath));
+
+    writeShadowHeader(shadowHeader);
+    std::filesystem::resize_file(shadowFilePath, 1);
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, ActiveRecoveryMarkerSupersedesFrozenCommits) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 1});")->isSuccess());
+
+    auto& context = *getClientContext(*conn);
+    ASSERT_TRUE(WAL::Get(context)->rotateForCheckpoint(&context));
+    RecoveryCheckpointerLeavesActiveMarker checkpointer{context};
+    checkpointer.writeActiveCheckpointMarker();
+
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+    ASSERT_TRUE(std::filesystem::exists(activeWalPath));
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+
+    auto result = conn->query("MATCH (n:test) RETURN n.id;");
+    ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
+    ASSERT_EQ(result->getNumTuples(), 1);
+    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
+    ASSERT_FALSE(std::filesystem::exists(activeWalPath));
+    ASSERT_FALSE(std::filesystem::exists(frozenWalPath));
+    ASSERT_FALSE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, FailedNonRotatedCheckpointBeforeMarkerRequiresRestart) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
@@ -524,7 +1644,7 @@ TEST_F(FlakyCheckpointerTest, RecoverWriterAfterFailedNonRotatedCheckpoint) {
     ASSERT_TRUE(conn->query("CHECKPOINT;")->isSuccess());
 
     auto initFlakyCheckpointer = [](main::ClientContext& context) {
-        return std::make_unique<FlakyCheckpointerFailsOnApplyingShadow>(context);
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
     };
     FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
     flakyCheckpointer.setCheckpointer(*getClientContext(*conn));
@@ -532,11 +1652,11 @@ TEST_F(FlakyCheckpointerTest, RecoverWriterAfterFailedNonRotatedCheckpoint) {
     auto checkpointResult = conn->query("CHECKPOINT;");
     ASSERT_FALSE(checkpointResult->isSuccess());
     const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
-    ASSERT_FALSE(std::filesystem::exists(activeWalPath));
+    ASSERT_TRUE(std::filesystem::exists(activeWalPath));
 
     auto writeResult = conn->query("CREATE (:test {id: 1});");
-    ASSERT_TRUE(writeResult->isSuccess()) << writeResult->getErrorMessage();
-    ASSERT_TRUE(std::filesystem::exists(activeWalPath));
+    ASSERT_FALSE(writeResult->isSuccess());
+    ASSERT_NE(writeResult->getErrorMessage().find("must be restarted"), std::string::npos);
 
     writeResult.reset();
     checkpointResult.reset();
@@ -546,9 +1666,8 @@ TEST_F(FlakyCheckpointerTest, RecoverWriterAfterFailedNonRotatedCheckpoint) {
 
     auto result = conn->query("MATCH (n:test) RETURN n.id ORDER BY n.id;");
     ASSERT_TRUE(result->isSuccess()) << result->getErrorMessage();
-    ASSERT_EQ(result->getNumTuples(), 2);
+    ASSERT_EQ(result->getNumTuples(), 1);
     ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 0);
-    ASSERT_EQ(result->getNext()->getValue(0)->getValue<int64_t>(), 1);
 }
 
 class FlakyCheckpointerFailsAfterClearingShadow final : public Checkpointer {
@@ -563,7 +1682,8 @@ public:
         const auto storageManager = StorageManager::Get(clientContext);
         auto& shadowFile = storageManager->getShadowFile();
         shadowFile.flushAll(clientContext);
-        WAL::Get(clientContext)->logAndFlushCheckpointToFrozen(&clientContext);
+        markCheckpointMarkerWriteStarted();
+        WAL::Get(clientContext)->logAndFlushCheckpointToFrozen(&clientContext, checkpointID);
         markShadowApplicationStarted();
         shadowFile.applyShadowPages(clientContext);
         shadowFile.clear(*MemoryManager::Get(clientContext)->getBufferManager());
@@ -594,7 +1714,8 @@ public:
         const auto storageManager = StorageManager::Get(clientContext);
         auto& shadowFile = storageManager->getShadowFile();
         shadowFile.flushAll(clientContext);
-        WAL::Get(clientContext)->logAndFlushCheckpointToFrozen(&clientContext);
+        markCheckpointMarkerWriteStarted();
+        WAL::Get(clientContext)->logAndFlushCheckpointToFrozen(&clientContext, checkpointID);
         markShadowApplicationStarted();
         shadowFile.applyShadowPages(clientContext);
         shadowFile.clear(*MemoryManager::Get(clientContext)->getBufferManager());
@@ -624,10 +1745,11 @@ public:
         auto& shadowFile = storageManager->getShadowFile();
         shadowFile.flushAll(clientContext);
         auto wal = WAL::Get(clientContext);
+        markCheckpointMarkerWriteStarted();
         if (walRotated) {
-            wal->logAndFlushCheckpointToFrozen(&clientContext);
+            wal->logAndFlushCheckpointToFrozen(&clientContext, checkpointID);
         } else {
-            wal->logAndFlushCheckpoint(&clientContext);
+            wal->logAndFlushCheckpoint(&clientContext, checkpointID);
         }
         markShadowApplicationStarted();
         shadowFile.applyShadowPages(clientContext);
@@ -727,7 +1849,7 @@ TEST_F(FlakyCheckpointerTest, ShadowFileDatabaseIDMismatchExistingDB) {
         GTEST_SKIP();
     }
     auto initFlakyCheckpointer = [](main::ClientContext& context) {
-        return std::make_unique<FlakyCheckpointerFailsOnClearingFiles>(context);
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
     };
     FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
     runFlakyCheckpoint(flakyCheckpointer);
@@ -760,6 +1882,76 @@ TEST_F(FlakyCheckpointerTest, ShadowFileDatabaseIDMismatchExistingDB) {
 
     // The shadow file replay should now fail
     EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalFilePath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, ShadowFileCheckpointIDMismatch) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnClearingFiles>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+
+    mutateShadowCheckpointID();
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+}
+
+TEST_F(FlakyCheckpointerTest, MarkerFreeCheckpointIDMismatchFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+    mutateShadowCheckpointID();
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(FlakyCheckpointerTest, MarkerFreeCheckpointWatermarkMismatchFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    auto initFlakyCheckpointer = [](main::ClientContext& context) {
+        return std::make_unique<FlakyCheckpointerFailsOnSerialization>(context);
+    };
+    FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
+    runFlakyCheckpoint(flakyCheckpointer);
+
+    conn.reset();
+    database.reset();
+    auto shadowHeader = readShadowHeader();
+    shadowHeader.checkpointStartDataFileNumPages++;
+    shadowHeader.checkpointStartDataFileNumPagesCheck =
+        ~shadowHeader.checkpointStartDataFileNumPages;
+    writeShadowHeader(shadowHeader);
+    const auto dataFileSize = std::filesystem::file_size(databasePath);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto shadowFilePath = StorageUtils::getShadowFilePath(databasePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_EQ(std::filesystem::file_size(databasePath), dataFileSize);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
 }
 
 TEST_F(FlakyCheckpointerTest, ShadowFileDatabaseIDMismatchNewDB) {
@@ -796,7 +1988,7 @@ TEST_F(FlakyCheckpointerTest, ShadowFileDatabaseIDMismatchCorruptedDB) {
     ofs.close();
 
     // The shadow file replay should now fail
-    EXPECT_THROW(createDBAndConn(), InternalException);
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
 }
 
 } // namespace testing

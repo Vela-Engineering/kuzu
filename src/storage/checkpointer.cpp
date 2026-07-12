@@ -114,6 +114,12 @@ void Checkpointer::writeCheckpoint() {
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
     auto databaseHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+    auto& shadowFile = storageManager->getShadowFile();
+    checkpointID = shadowFile.beginCheckpoint(
+        clientContext, storageManager->getDataFH()->getNumPages());
+    checkpointBeginWriteStarted = true;
+    storageManager->getWAL().logAndFlushCheckpointStart(&clientContext, checkpointID,
+        shadowFile.getCheckpointStartDataFileNumPages(), walRotated);
     bool hasStorageChanges = checkpointStorage();
     serializeCatalogAndMetadata(databaseHeader, hasStorageChanges);
     writeDatabaseHeader(databaseHeader);
@@ -135,14 +141,20 @@ void Checkpointer::writeRecoveryCheckpoint() {
     }
 
     auto databaseHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+    auto& shadowFile = storageManager->getShadowFile();
+    checkpointID = shadowFile.beginCheckpoint(
+        clientContext, storageManager->getDataFH()->getNumPages());
+    checkpointBeginWriteStarted = true;
+    storageManager->getWAL().logAndFlushCheckpointStart(&clientContext, checkpointID,
+        shadowFile.getCheckpointStartDataFileNumPages(), false);
     const auto hasStorageChanges = checkpointStorage();
     serializeCatalogAndMetadata(databaseHeader, hasStorageChanges);
     writeDatabaseHeader(databaseHeader);
 
-    auto& shadowFile = storageManager->getShadowFile();
     shadowFile.flushAll(clientContext);
     auto& wal = storageManager->getWAL();
-    wal.logAndFlushCheckpoint(&clientContext);
+    markCheckpointMarkerWriteStarted();
+    wal.logAndFlushCheckpoint(&clientContext, checkpointID);
     shadowFile.applyShadowPages(clientContext);
 
     catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
@@ -153,10 +165,10 @@ void Checkpointer::writeRecoveryCheckpoint() {
     catalog::Catalog::Get(clientContext)->resetVersion(catalogVersionAtCheckpoint);
     storageManager->getDataFH()->getPageManager()->resetVersion(pageManagerVersionAtCheckpoint);
 
-    wal.clearFrozenWAL();
-    wal.reset();
     shadowFile.clear(*bufferManager);
     shadowFile.reset();
+    wal.clearFrozenWAL();
+    wal.reset();
 }
 
 void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
@@ -166,11 +178,19 @@ void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
 
     snapshotTS = snapshotTimestamp;
     shadowApplicationStarted = false;
+    checkpointBeginWriteStarted = false;
+    checkpointMarkerWriteStarted = false;
 
     auto storageManager = StorageManager::Get(clientContext);
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
     checkpointHeader = *storageManager->getOrInitDatabaseHeader(clientContext);
+    auto& shadowFile = storageManager->getShadowFile();
+    checkpointID = shadowFile.beginCheckpoint(
+        clientContext, storageManager->getDataFH()->getNumPages());
+    checkpointBeginWriteStarted = true;
+    storageManager->getWAL().logAndFlushCheckpointStart(&clientContext, checkpointID,
+        shadowFile.getCheckpointStartDataFileNumPages(), walRotated);
 
     // Capture versions before any transaction can start after WAL rotation.
     catalogVersionAtCheckpoint = catalog::Catalog::Get(clientContext)->getVersion();
@@ -207,14 +227,14 @@ void Checkpointer::postCheckpointCleanup() {
     catalog::Catalog::Get(clientContext)->resetVersion(catalogVersionAtCheckpoint);
     auto* dataFH = storageManager->getDataFH();
     dataFH->getPageManager()->resetVersion(pageManagerVersionAtCheckpoint);
+    auto& shadowFile = storageManager->getShadowFile();
+    shadowFile.clear(*bufferManager);
+    shadowFile.reset();
     if (walRotated) {
         storageManager->getWAL().clearFrozenWAL();
     } else {
         storageManager->getWAL().reset();
     }
-    auto& shadowFile = storageManager->getShadowFile();
-    shadowFile.clear(*bufferManager);
-    shadowFile.reset();
 }
 
 bool Checkpointer::checkpointStorage() {
@@ -309,10 +329,11 @@ void Checkpointer::logCheckpointAndApplyShadowPages(bool walRotated) {
     auto& shadowFile = storageManager->getShadowFile();
     shadowFile.flushAll(clientContext);
     auto wal = WAL::Get(clientContext);
+    markCheckpointMarkerWriteStarted();
     if (walRotated) {
-        wal->logAndFlushCheckpointToFrozen(&clientContext);
+        wal->logAndFlushCheckpointToFrozen(&clientContext, checkpointID);
     } else {
-        wal->logAndFlushCheckpoint(&clientContext);
+        wal->logAndFlushCheckpoint(&clientContext, checkpointID);
     }
     markShadowApplicationStarted();
     shadowFile.applyShadowPages(clientContext);
@@ -350,8 +371,10 @@ bool Checkpointer::canAutoCheckpoint(const main::ClientContext& clientContext,
 
 void Checkpointer::readCheckpoint() {
     auto storageManager = StorageManager::Get(clientContext);
-    storageManager->initDataFileHandle(common::VirtualFileSystem::GetUnsafe(clientContext),
-        &clientContext);
+    if (!storageManager->getDataFH()) {
+        storageManager->initDataFileHandle(common::VirtualFileSystem::GetUnsafe(clientContext),
+            &clientContext);
+    }
     if (!isInMemory && storageManager->getDataFH()->getNumPages() > 0) {
         readCheckpoint(&clientContext, catalog::Catalog::Get(clientContext), storageManager);
     }

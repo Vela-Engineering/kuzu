@@ -4,6 +4,7 @@
 #include "common/exception/runtime.h"
 #include "common/exception/storage.h"
 #include "gmock/gmock.h"
+#include "storage/shadow_file.h"
 #include "storage/storage_utils.h"
 
 using namespace kuzu::common;
@@ -84,10 +85,9 @@ TEST_F(WalTest, ShadowFileExistsWithoutWAL) {
     conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
     conn->query("COMMIT;");
     auto shadowFilePath = kuzu::storage::StorageUtils::getShadowFilePath(databasePath);
-    // Create a shadow file that is corrupted.
-    std::ofstream file(shadowFilePath);
-    file << "This is not a valid Kuzu database file.";
+    std::ofstream file(shadowFilePath, std::ios::binary);
     file.close();
+    std::filesystem::resize_file(shadowFilePath, KUZU_PAGE_SIZE);
     auto walFilePath = kuzu::storage::StorageUtils::getWALFilePath(databasePath);
     ASSERT_TRUE(std::filesystem::exists(walFilePath));
     ASSERT_TRUE(std::filesystem::file_size(walFilePath) > 0);
@@ -100,6 +100,29 @@ TEST_F(WalTest, ShadowFileExistsWithoutWAL) {
     ASSERT_EQ(res->getNumTuples(), 0);
     ASSERT_FALSE(std::filesystem::exists(walFilePath));
     ASSERT_FALSE(std::filesystem::exists(shadowFilePath));
+}
+
+TEST_F(WalTest, InvalidShadowIdentityWithoutWALFailsClosed) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    conn->query("CALL force_checkpoint_on_close=false");
+    conn->query("BEGIN TRANSACTION;");
+    conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
+    conn->query("COMMIT;");
+    const auto shadowFilePath = kuzu::storage::StorageUtils::getShadowFilePath(databasePath);
+    std::ofstream file(shadowFilePath, std::ios::binary);
+    kuzu::storage::ShadowFileHeader header;
+    header.checkpointPageWatermarkMagic = 1;
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    file.close();
+    std::filesystem::resize_file(shadowFilePath, KUZU_PAGE_SIZE);
+    const auto walFilePath = kuzu::storage::StorageUtils::getWALFilePath(databasePath);
+    ASSERT_TRUE(std::filesystem::exists(walFilePath));
+    std::filesystem::remove(walFilePath);
+
+    EXPECT_THROW(createDBAndConn(), RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(shadowFilePath));
 }
 
 TEST_F(WalTest, ShadowFileExistsWithEmptyWAL) {
@@ -161,7 +184,7 @@ TEST_F(WalTest, CorruptedWALChecksumMismatchInHeader) {
     EXPECT_THROW(createDBAndConn();, kuzu::common::StorageException);
 }
 
-TEST_F(WalTest, CorruptedWALChecksumMismatchInHeaderNoThrow) {
+TEST_F(WalTest, CorruptedWALChecksumMismatchInHeaderFailsClosed) {
     if (inMemMode || systemConfig->checkpointThreshold == 0 || !systemConfig->enableChecksums) {
         GTEST_SKIP();
     }
@@ -171,10 +194,9 @@ TEST_F(WalTest, CorruptedWALChecksumMismatchInHeaderNoThrow) {
         walFileToCorrupt << "abc";
     });
 
-    // The replay shouldn't complete but shouldn't throw either
-    createDBAndConn();
-    auto result = conn->query("match (t:test) return count(*)");
-    EXPECT_FALSE(result->isSuccess());
+    const auto walFilePath = kuzu::storage::StorageUtils::getWALFilePath(databasePath);
+    EXPECT_THROW(createDBAndConn(), kuzu::common::RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(walFilePath));
 }
 
 TEST_F(WalTest, CorruptedWALChecksumMismatchInBody) {
@@ -195,8 +217,7 @@ TEST_F(WalTest, CorruptedWALChecksumMismatchInBodyNoThrow) {
         GTEST_SKIP();
     }
     setupChecksumMismatchTest([](std::ofstream& walFileToCorrupt) {
-        walFileToCorrupt.seekp(10);
-        // 10 bytes in will be the database ID's checksum
+        walFileToCorrupt.seekp(30);
         walFileToCorrupt << "abc";
     });
     // The replay shouldn't complete but shouldn't throw either
@@ -236,7 +257,7 @@ TEST_F(WalTest, WALChecksumConfigMismatch) {
         kuzu::common::RuntimeException);
 }
 
-TEST_F(WalTest, WALChecksumConfigMismatchNoThrow) {
+TEST_F(WalTest, WALChecksumConfigMismatchFailsClosed) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
@@ -246,11 +267,9 @@ TEST_F(WalTest, WALChecksumConfigMismatchNoThrow) {
     ASSERT_TRUE(conn->query("create node table test2(id int64 primary key)")->isSuccess());
     systemConfig->enableChecksums = !systemConfig->enableChecksums;
     systemConfig->throwOnWalReplayFailure = false;
-    // We have throwOnWalReplayFailure=false so we essentially skip the replay
-    createDBAndConn();
-    auto res = conn->query("CALL show_tables() WHERE name STARTS WITH 'test' RETURN *;");
-    ASSERT_TRUE(res->isSuccess());
-    ASSERT_EQ(res->getNumTuples(), 0);
+    const auto walFilePath = kuzu::storage::StorageUtils::getWALFilePath(databasePath);
+    EXPECT_THROW(createDBAndConn(), kuzu::common::RuntimeException);
+    ASSERT_TRUE(std::filesystem::exists(walFilePath));
 }
 
 // Simulation of a corrupted WAL tail by truncating the WAL file. Note that in this case, there
@@ -281,7 +300,7 @@ TEST_F(WalTest, CorruptedWALTailTruncated) {
 // Simulation of a corrupted WAL tail by truncating the WAL file, but then continuing to write to
 // the WAL, and recover from the same WAL file again. This should recover the tables that were
 // created after the database's first recovering from the corrupted WAL.
-TEST_F(WalTest, CorruptedWALTailTruncatedAndRecoverTwice) {
+TEST_F(WalTest, CorruptedWALTruncatedAndRecoveredTwice) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
@@ -433,7 +452,7 @@ TEST_F(WalTest, WALFileLeftoverFromPreviousDBNewDBCOPYWithoutCheckpointReadOnly)
 // Similar to CorruptedWALTailTruncated2, but with multiple transactions and then recovering from
 // the WAL file again. This should recover the tables that were created after the database's first
 // recovering from the corrupted WAL.
-TEST_F(WalTest, CorruptedWALTailTruncated2RecoverTwice) {
+TEST_F(WalTest, CorruptedWALTruncated2RecoveredTwice) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
         GTEST_SKIP();
     }
@@ -507,7 +526,7 @@ TEST_F(WalTest, ReadOnlyRecoveryFromCorruptedWALTail) {
     auto res = conn->query("MATCH (n:test) RETURN n.id ORDER BY n.id;");
     ASSERT_TRUE(res->isSuccess());
     // Should still recover up to the last valid record
-    ASSERT_GE(res->getNumTuples(), 0);
+    ASSERT_EQ(res->getNumTuples(), 2);
     // WAL file should remain unchanged in read-only mode
     ASSERT_TRUE(std::filesystem::exists(walFilePath));
 }
@@ -536,7 +555,7 @@ TEST_F(WalTest, ReadOnlyRecoveryWithShadowFile) {
     auto res = conn->query("MATCH (n:test) RETURN n.id ORDER BY n.id;");
     ASSERT_TRUE(res->isSuccess());
     // Should handle WAL recovery correctly
-    ASSERT_GE(res->getNumTuples(), 0);
+    ASSERT_EQ(res->getNumTuples(), 1);
     // Files should remain unchanged in read-only mode
     ASSERT_TRUE(std::filesystem::exists(walFilePath));
     ASSERT_TRUE(std::filesystem::exists(shadowFilePath));

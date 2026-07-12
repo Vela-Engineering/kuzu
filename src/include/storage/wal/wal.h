@@ -24,10 +24,14 @@ public:
     ~WAL();
 
     void logCommittedWAL(LocalWAL& localWAL, main::ClientContext* context);
-    void logAndFlushCheckpoint(main::ClientContext* context);
+    void logAndFlushCheckpointStart(main::ClientContext* context,
+        common::ku_uuid_t checkpointID, common::page_idx_t checkpointStartDataFileNumPages,
+        bool frozenWAL);
+    void logAndFlushCheckpoint(main::ClientContext* context, common::ku_uuid_t checkpointID);
 
     bool rotateForCheckpoint(main::ClientContext* context);
-    void logAndFlushCheckpointToFrozen(main::ClientContext* context);
+    void logAndFlushCheckpointToFrozen(main::ClientContext* context,
+        common::ku_uuid_t checkpointID);
     void clearFrozenWAL();
     bool hasFrozenWAL() const;
 

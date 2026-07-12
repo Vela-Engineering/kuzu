@@ -19,12 +19,15 @@ void WALRecord::serialize(Serializer& serializer) const {
 }
 
 std::unique_ptr<WALRecord> WALRecord::deserialize(Deserializer& deserializer,
-    const main::ClientContext& clientContext) {
+    const main::ClientContext& clientContext, WALRecordType* encounteredType) {
     std::string key;
     auto type = WALRecordType::INVALID_RECORD;
     deserializer.getReader()->onObjectBegin();
     deserializer.validateDebuggingInfo(key, "type");
     deserializer.deserializeValue(type);
+    if (encounteredType) {
+        *encounteredType = type;
+    }
     std::unique_ptr<WALRecord> walRecord;
     switch (type) {
     case WALRecordType::BEGIN_TRANSACTION_RECORD: {
@@ -66,6 +69,12 @@ std::unique_ptr<WALRecord> WALRecord::deserialize(Deserializer& deserializer,
     case WALRecordType::CHECKPOINT_RECORD: {
         walRecord = CheckpointRecord::deserialize(deserializer);
     } break;
+    case WALRecordType::CHECKPOINT_RECORD_V2: {
+        walRecord = CheckpointRecordV2::deserialize(deserializer);
+    } break;
+    case WALRecordType::CHECKPOINT_BEGIN_RECORD: {
+        walRecord = CheckpointBeginRecord::deserialize(deserializer);
+    } break;
     case WALRecordType::UPDATE_SEQUENCE_RECORD: {
         walRecord = UpdateSequenceRecord::deserialize(deserializer);
     } break;
@@ -106,6 +115,38 @@ void CheckpointRecord::serialize(Serializer& serializer) const {
 
 std::unique_ptr<CheckpointRecord> CheckpointRecord::deserialize(Deserializer&) {
     return std::make_unique<CheckpointRecord>();
+}
+
+void CheckpointRecordV2::serialize(Serializer& serializer) const {
+    WALRecord::serialize(serializer);
+    serializer.write(checkpointID.value);
+    serializer.write(checkpointEndDataFileNumPages);
+    serializer.write(checkpointEndDataFileNumPagesCheck);
+}
+
+std::unique_ptr<CheckpointRecordV2> CheckpointRecordV2::deserialize(
+    Deserializer& deserializer) {
+    auto result = std::make_unique<CheckpointRecordV2>();
+    deserializer.deserializeValue(result->checkpointID.value);
+    deserializer.deserializeValue(result->checkpointEndDataFileNumPages);
+    deserializer.deserializeValue(result->checkpointEndDataFileNumPagesCheck);
+    return result;
+}
+
+void CheckpointBeginRecord::serialize(Serializer& serializer) const {
+    WALRecord::serialize(serializer);
+    serializer.write(checkpointID.value);
+    serializer.write(checkpointStartDataFileNumPages);
+    serializer.write(checkpointStartDataFileNumPagesCheck);
+}
+
+std::unique_ptr<CheckpointBeginRecord> CheckpointBeginRecord::deserialize(
+    Deserializer& deserializer) {
+    auto result = std::make_unique<CheckpointBeginRecord>();
+    deserializer.deserializeValue(result->checkpointID.value);
+    deserializer.deserializeValue(result->checkpointStartDataFileNumPages);
+    deserializer.deserializeValue(result->checkpointStartDataFileNumPagesCheck);
+    return result;
 }
 
 void CreateCatalogEntryRecord::serialize(Serializer& serializer) const {

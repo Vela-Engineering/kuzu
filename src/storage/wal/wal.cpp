@@ -38,10 +38,39 @@ void WAL::logCommittedWAL(LocalWAL& localWAL, main::ClientContext* context) {
     flushAndSyncNoLock(true);
 }
 
-void WAL::logAndFlushCheckpoint(main::ClientContext* context) {
+void WAL::logAndFlushCheckpointStart(
+    main::ClientContext* context, ku_uuid_t checkpointID,
+    page_idx_t checkpointStartDataFileNumPages, bool frozenWAL) {
+    CheckpointBeginRecord walRecord{checkpointID, checkpointStartDataFileNumPages};
+    if (frozenWAL) {
+        auto frozenFileInfo = vfs->openFile(checkpointWalPath,
+            FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE), context);
+        std::shared_ptr<Writer> writer = std::make_shared<BufferedFileWriter>(*frozenFileInfo);
+        auto& bufferedWriter = writer->cast<BufferedFileWriter>();
+        if (enableChecksums) {
+            writer = std::make_shared<ChecksumWriter>(
+                std::move(writer), *MemoryManager::Get(*context));
+        }
+        Serializer frozenSerializer{std::move(writer)};
+        bufferedWriter.setFileOffset(frozenFileInfo->getFileSize());
+        frozenSerializer.getWriter()->onObjectBegin();
+        walRecord.serialize(frozenSerializer);
+        frozenSerializer.getWriter()->onObjectEnd();
+        frozenSerializer.getWriter()->flush();
+        frozenSerializer.getWriter()->sync();
+        return;
+    }
     std::unique_lock lck{mtx};
     initWriter(context);
-    CheckpointRecord walRecord;
+    addNewWALRecordNoLock(walRecord);
+    flushAndSyncNoLock();
+}
+
+void WAL::logAndFlushCheckpoint(main::ClientContext* context, ku_uuid_t checkpointID) {
+    std::unique_lock lck{mtx};
+    initWriter(context);
+    CheckpointRecordV2 walRecord{
+        checkpointID, StorageManager::Get(*context)->getDataFH()->getNumPages()};
     addNewWALRecordNoLock(walRecord);
     flushAndSyncNoLock();
 }
@@ -72,7 +101,8 @@ bool WAL::rotateForCheckpoint(main::ClientContext* /*context*/) {
     return true;
 }
 
-void WAL::logAndFlushCheckpointToFrozen(main::ClientContext* context) {
+void WAL::logAndFlushCheckpointToFrozen(
+    main::ClientContext* context, ku_uuid_t checkpointID) {
     auto frozenFileInfo = vfs->openFile(checkpointWalPath,
         FileOpenFlags(FileFlags::READ_ONLY | FileFlags::WRITE), context);
 
@@ -84,7 +114,8 @@ void WAL::logAndFlushCheckpointToFrozen(main::ClientContext* context) {
     auto frozenSerializer = std::make_unique<Serializer>(std::move(writer));
     bufferedWriter.setFileOffset(frozenFileInfo->getFileSize());
 
-    CheckpointRecord walRecord;
+    CheckpointRecordV2 walRecord{
+        checkpointID, StorageManager::Get(*context)->getDataFH()->getNumPages()};
     frozenSerializer->getWriter()->onObjectBegin();
     walRecord.serialize(*frozenSerializer);
     frozenSerializer->getWriter()->onObjectEnd();

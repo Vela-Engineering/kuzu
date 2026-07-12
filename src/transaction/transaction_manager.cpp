@@ -330,30 +330,29 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     try {
         checkpointer->beginCheckpoint(lastTimestamp);
     } catch (std::exception& e) {
+        if (checkpointer->wasCheckpointBeginWriteStarted()) {
+            checkpointRecoveryRequired = true;
+        }
         rollbackCheckpoint();
         throw CheckpointException{e};
     }
     try {
         checkpointer->checkpointStoragePhase();
     } catch (std::exception& e) {
+        if (!checkpointer->wasWalRotated()) {
+            checkpointRecoveryRequired = true;
+        }
         rollbackCheckpoint();
         throw CheckpointException{e};
     }
     try {
         checkpointer->finishCheckpoint();
     } catch (std::exception& e) {
-        if (checkpointer->wasShadowApplicationStarted()) {
+        if (!checkpointer->wasWalRotated() ||
+            checkpointer->wasCheckpointMarkerWriteStarted()) {
             checkpointRecoveryRequired = true;
         }
         rollbackCheckpoint();
-        if (!checkpointer->wasShadowApplicationStarted() && !checkpointer->wasWalRotated()) {
-            try {
-                WAL::Get(clientContext)->reset();
-            } catch (std::exception& cleanupError) {
-                checkpointRecoveryRequired = true;
-                throw CheckpointException{cleanupError};
-            }
-        }
         throw CheckpointException{e};
     }
     try {
