@@ -89,6 +89,7 @@ void ShadowFile::applyShadowPages(ClientContext& context) const {
     const auto pageBuffer = std::make_unique<uint8_t[]>(KUZU_PAGE_SIZE);
     auto dataFileInfo = StorageManager::Get(context)->getDataFH()->getFileInfo();
     KU_ASSERT(shadowingFH);
+    uint64_t pagesApplied = 0;
     for (const auto& record : shadowPageRecords) {
         shadowingFH->readPageFromDisk(pageBuffer.get(), record.shadowPageIdx);
         dataFileInfo->writeFile(pageBuffer.get(), KUZU_PAGE_SIZE,
@@ -97,6 +98,9 @@ void ShadowFile::applyShadowPages(ClientContext& context) const {
         // optimistic readers will detect the version change and retry, seeing the new page data.
         MemoryManager::Get(context)->getBufferManager()->updateFrameIfPageIsInFrame(
             record.originalFileIdx, pageBuffer.get(), record.originalPageIdx);
+        if (pageAppliedHookForTesting) {
+            pageAppliedHookForTesting(++pagesApplied);
+        }
     }
     dataFileInfo->syncFile();
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <optional>
 
 #include "common/types/uuid.h"
@@ -48,6 +49,9 @@ public:
     FileHandle& getShadowingFH() const { return *shadowingFH; }
 
     void applyShadowPages(main::ClientContext& context) const;
+    void setPageAppliedHookForTesting(std::function<void(uint64_t)> hook) {
+        pageAppliedHookForTesting = std::move(hook);
+    }
 
     common::ku_uuid_t beginCheckpoint(main::ClientContext& context,
         common::page_idx_t dataFileNumPages);
@@ -88,6 +92,7 @@ private:
     std::vector<ShadowPageRecord> shadowPageRecords;
     common::page_idx_t checkpointStartDataFileNumPages = common::INVALID_PAGE_IDX;
     std::optional<common::ku_uuid_t> checkpointID;
+    std::function<void(uint64_t)> pageAppliedHookForTesting;
 };
 
 } // namespace storage

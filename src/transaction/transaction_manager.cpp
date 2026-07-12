@@ -348,6 +348,19 @@ void TransactionManager::checkpointNoLock(main::ClientContext& clientContext) {
     try {
         checkpointer->finishCheckpoint();
     } catch (std::exception& e) {
+        if (checkpointer->wasCheckpointMarkerWritten()) {
+            try {
+                checkpointer->retryShadowApplication();
+                checkpointer->postCheckpointCleanup();
+            } catch (std::exception& recoveryException) {
+                checkpointRecoveryRequired = true;
+                const auto message = std::string{e.what()} +
+                                     " In-process checkpoint recovery failed: " +
+                                     recoveryException.what();
+                throw CheckpointException{Exception{message}};
+            }
+            throw CheckpointException{e};
+        }
         if (!checkpointer->wasWalRotated() ||
             checkpointer->wasCheckpointMarkerWriteStarted()) {
             checkpointRecoveryRequired = true;

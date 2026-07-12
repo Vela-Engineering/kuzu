@@ -44,12 +44,14 @@ public:
     void checkpointStoragePhase();
     void finishCheckpoint();
     // Cleanup after the core checkpoint.
-    void postCheckpointCleanup();
+    virtual void postCheckpointCleanup();
+    void retryShadowApplication();
     void rollback();
     bool wasWalRotated() const { return walRotated; }
     bool wasShadowApplicationStarted() const { return shadowApplicationStarted; }
     bool wasCheckpointBeginWriteStarted() const { return checkpointBeginWriteStarted; }
     bool wasCheckpointMarkerWriteStarted() const { return checkpointMarkerWriteStarted; }
+    bool wasCheckpointMarkerWritten() const { return checkpointMarkerWritten; }
 
     void readCheckpoint();
 
@@ -64,6 +66,7 @@ protected:
     virtual void logCheckpointAndApplyShadowPages(bool walRotated);
     void markShadowApplicationStarted() { shadowApplicationStarted = true; }
     void markCheckpointMarkerWriteStarted() { checkpointMarkerWriteStarted = true; }
+    void markCheckpointMarkerWritten() { checkpointMarkerWritten = true; }
 
 private:
     static void readCheckpoint(main::ClientContext* context, catalog::Catalog* catalog,
@@ -85,6 +88,7 @@ protected:
     bool shadowApplicationStarted = false;
     bool checkpointBeginWriteStarted = false;
     bool checkpointMarkerWriteStarted = false;
+    bool checkpointMarkerWritten = false;
     common::ku_uuid_t checkpointID{0};
     // Snapshot timestamp captured at drain time for MVCC catalog serialization.
     common::transaction_t snapshotTS = 0;
