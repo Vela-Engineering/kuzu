@@ -103,6 +103,8 @@ protected:
 
     static void setCommitSyncHook(main::Database& database, std::function<void()> hook);
 
+    static void setCheckpointRotationHook(main::Database& database, std::function<void()> hook);
+
     static void setCommitPublicationHook(main::Database& database, std::function<void()> hook);
 
     // Static functions to access Connection's non-public properties/interfaces.

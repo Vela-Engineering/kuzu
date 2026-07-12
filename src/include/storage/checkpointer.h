@@ -48,6 +48,7 @@ public:
     void retryShadowApplication();
     void rollback();
     bool wasWalRotated() const { return walRotated; }
+    bool wasWalRotationStarted() const { return walRotationStarted; }
     bool wasShadowApplicationStarted() const { return shadowApplicationStarted; }
     bool wasCheckpointBeginWriteStarted() const { return checkpointBeginWriteStarted; }
     bool wasCheckpointMarkerWriteStarted() const { return checkpointMarkerWriteStarted; }
@@ -85,6 +86,7 @@ protected:
     main::ClientContext& clientContext;
     bool isInMemory;
     bool walRotated = false;
+    bool walRotationStarted = false;
     bool shadowApplicationStarted = false;
     bool checkpointBeginWriteStarted = false;
     bool checkpointMarkerWriteStarted = false;

@@ -185,6 +185,7 @@ void Checkpointer::beginCheckpoint(common::transaction_t snapshotTimestamp) {
     checkpointMarkerWritten = false;
 
     auto storageManager = StorageManager::Get(clientContext);
+    walRotationStarted = true;
     walRotated = storageManager->getWAL().rotateForCheckpoint(&clientContext);
 
     checkpointHeader = *storageManager->getOrInitDatabaseHeader(clientContext);

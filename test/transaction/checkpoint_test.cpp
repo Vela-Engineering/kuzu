@@ -331,6 +331,21 @@ public:
 
     void runTest(const FlakyCheckpointer& flakyCheckpointer) {
         runFlakyCheckpoint(flakyCheckpointer);
+        const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+        const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+        ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+        const auto frozenWalSize = std::filesystem::file_size(frozenWalPath);
+        auto writeResult = conn->query("CREATE (:test {id: 5000, name: 'blocked'});");
+        ASSERT_FALSE(writeResult->isSuccess());
+        ASSERT_NE(writeResult->getErrorMessage().find("must be restarted"), std::string::npos);
+        auto checkpointResult = conn->query("CHECKPOINT;");
+        ASSERT_FALSE(checkpointResult->isSuccess());
+        ASSERT_NE(checkpointResult->getErrorMessage().find("must be restarted"), std::string::npos);
+        ASSERT_FALSE(std::filesystem::exists(activeWalPath));
+        ASSERT_EQ(std::filesystem::file_size(frozenWalPath), frozenWalSize);
+
+        writeResult.reset();
+        checkpointResult.reset();
         createDBAndConn();
         auto res = conn->query("MATCH (a:test) RETURN COUNT(a);");
         ASSERT_TRUE(res->isSuccess());
@@ -355,6 +370,47 @@ TEST_F(FlakyCheckpointerTest, RecoverFromCheckpointStorageFailure) {
     };
     FlakyCheckpointer flakyCheckpointer(initFlakyCheckpointer);
     runTest(flakyCheckpointer);
+}
+
+TEST_F(FlakyCheckpointerTest, FailedWalRotationRequiresRestart) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE test(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE (:test {id: 0});")->isSuccess());
+    setCheckpointRotationHook(*database,
+        []() { throw RuntimeException("injected failure after WAL rotation"); });
+
+    auto checkpointResult = conn->query("CHECKPOINT;");
+    ASSERT_FALSE(checkpointResult->isSuccess());
+    ASSERT_NE(checkpointResult->getErrorMessage().find("injected failure after WAL rotation"),
+        std::string::npos);
+    setCheckpointRotationHook(*database, {});
+
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    ASSERT_FALSE(std::filesystem::exists(activeWalPath));
+    ASSERT_FALSE(std::filesystem::exists(StorageUtils::getShadowFilePath(databasePath)));
+    const auto frozenWalSize = std::filesystem::file_size(frozenWalPath);
+    auto writeResult = conn->query("CREATE (:test {id: 1});");
+    ASSERT_FALSE(writeResult->isSuccess());
+    ASSERT_NE(writeResult->getErrorMessage().find("must be restarted"), std::string::npos);
+    ASSERT_FALSE(std::filesystem::exists(activeWalPath));
+    ASSERT_EQ(std::filesystem::file_size(frozenWalPath), frozenWalSize);
+
+    checkpointResult.reset();
+    writeResult.reset();
+    conn.reset();
+    database.reset();
+    createDBAndConn();
+    auto countResult = conn->query("MATCH (n:test) RETURN COUNT(n);");
+    ASSERT_TRUE(countResult->isSuccess()) << countResult->getErrorMessage();
+    ASSERT_EQ(countResult->getNext()->getValue(0)->getValue<int64_t>(), 1);
+    ASSERT_FALSE(std::filesystem::exists(frozenWalPath));
+    ASSERT_FALSE(std::filesystem::exists(activeWalPath));
 }
 
 TEST_F(FlakyCheckpointerTest, AutoCheckpointRunsInBackground) {
@@ -504,6 +560,10 @@ TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
             "(a)-[:related {since: 2026}]->(b);");
     });
     ASSERT_EQ(writerFuture.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
+    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
+    ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
+    const auto frozenWalSize = std::filesystem::file_size(frozenWalPath);
     state->release();
     ASSERT_TRUE(state->waitUntilFinished(std::chrono::seconds(5)));
     ASSERT_EQ(checkpointFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
@@ -511,17 +571,19 @@ TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
     ASSERT_FALSE(checkpointResult->isSuccess());
     ASSERT_EQ(writerFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto writeResult = writerFuture.get();
-    ASSERT_TRUE(writeResult->isSuccess()) << writeResult->getErrorMessage();
+    ASSERT_FALSE(writeResult->isSuccess());
+    ASSERT_NE(writeResult->getErrorMessage().find("must be restarted"), std::string::npos);
 
-    const auto frozenWalPath = StorageUtils::getCheckpointWALFilePath(databasePath);
-    const auto activeWalPath = StorageUtils::getWALFilePath(databasePath);
     ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
-    ASSERT_TRUE(std::filesystem::exists(activeWalPath));
-    const auto frozenWalSize = std::filesystem::file_size(frozenWalPath);
+    ASSERT_FALSE(std::filesystem::exists(activeWalPath));
+    ASSERT_EQ(std::filesystem::file_size(frozenWalPath), frozenWalSize);
     auto retryCheckpointResult = conn->query("CHECKPOINT;");
     ASSERT_FALSE(retryCheckpointResult->isSuccess());
+    ASSERT_NE(retryCheckpointResult->getErrorMessage().find("must be restarted"),
+        std::string::npos);
     ASSERT_TRUE(std::filesystem::exists(frozenWalPath));
     ASSERT_EQ(std::filesystem::file_size(frozenWalPath), frozenWalSize);
+    ASSERT_FALSE(std::filesystem::exists(activeWalPath));
 
     writeResult.reset();
     checkpointResult.reset();
@@ -534,17 +596,12 @@ TEST_F(FlakyCheckpointerTest, RecoverConcurrentWriterAfterFailedCheckpoint) {
     auto verifyRecoveredData = [&]() {
         auto countResult = conn->query("MATCH (a:test) RETURN COUNT(a);");
         ASSERT_TRUE(countResult->isSuccess()) << countResult->getErrorMessage();
-        ASSERT_EQ(countResult->getNext()->getValue(0)->getValue<int64_t>(), 5001);
+        ASSERT_EQ(countResult->getNext()->getValue(0)->getValue<int64_t>(), 5000);
         auto relResult = conn->query(
             "MATCH (src:test)-[r:related]->(dst:test) "
             "RETURN src.id, dst.id, dst.name, r.since;");
         ASSERT_TRUE(relResult->isSuccess()) << relResult->getErrorMessage();
-        ASSERT_EQ(relResult->getNumTuples(), 1);
-        const auto tuple = relResult->getNext();
-        ASSERT_EQ(tuple->getValue(0)->getValue<int64_t>(), 0);
-        ASSERT_EQ(tuple->getValue(1)->getValue<int64_t>(), 5000);
-        ASSERT_EQ(tuple->getValue(2)->getValue<std::string>(), "concurrent");
-        ASSERT_EQ(tuple->getValue(3)->getValue<int64_t>(), 2026);
+        ASSERT_EQ(relResult->getNumTuples(), 0);
     };
     verifyRecoveredData();
     ASSERT_FALSE(std::filesystem::exists(frozenWalPath));

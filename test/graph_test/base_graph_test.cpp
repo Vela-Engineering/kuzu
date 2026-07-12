@@ -49,6 +49,10 @@ void BaseGraphTest::setCommitSyncHook(Database& database, std::function<void()> 
     database.storageManager->getWAL().setCommitSyncHookForTesting(std::move(hook));
 }
 
+void BaseGraphTest::setCheckpointRotationHook(Database& database, std::function<void()> hook) {
+    database.storageManager->getWAL().setCheckpointRotationHookForTesting(std::move(hook));
+}
+
 void BaseGraphTest::setCommitPublicationHook(Database& database, std::function<void()> hook) {
     database.transactionManager->setCommitPublicationHookForTesting(std::move(hook));
 }

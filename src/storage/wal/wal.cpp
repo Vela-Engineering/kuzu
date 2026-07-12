@@ -98,6 +98,9 @@ bool WAL::rotateForCheckpoint(main::ClientContext* /*context*/) {
 #else
     vfs->renameFileDurably(walPath, checkpointWalPath);
 #endif
+    if (checkpointRotationHookForTesting) {
+        checkpointRotationHookForTesting();
+    }
     return true;
 }
 
@@ -174,6 +177,11 @@ void WAL::flushAndSyncNoLock(bool isCommit) {
 void WAL::setCommitSyncHookForTesting(std::function<void()> hook) {
     std::unique_lock lck{mtx};
     commitSyncHookForTesting = std::move(hook);
+}
+
+void WAL::setCheckpointRotationHookForTesting(std::function<void()> hook) {
+    std::unique_lock lck{mtx};
+    checkpointRotationHookForTesting = std::move(hook);
 }
 
 uint64_t WAL::getFileSize() {

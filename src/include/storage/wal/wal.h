@@ -46,6 +46,7 @@ public:
 
 private:
     void setCommitSyncHookForTesting(std::function<void()> hook);
+    void setCheckpointRotationHookForTesting(std::function<void()> hook);
     void initWriter(main::ClientContext* context);
     void addNewWALRecordNoLock(const WALRecord& walRecord);
     void flushAndSyncNoLock(bool isCommit = false);
@@ -67,6 +68,7 @@ private:
     bool enableChecksums;
     bool syncFileCreationOnNextFlush;
     std::function<void()> commitSyncHookForTesting;
+    std::function<void()> checkpointRotationHookForTesting;
 };
 
 } // namespace storage
