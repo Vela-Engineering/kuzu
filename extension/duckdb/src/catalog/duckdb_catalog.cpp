@@ -33,9 +33,9 @@ DuckDBCatalog::DuckDBCatalog(std::string dbPath, std::string catalogName,
 
 void DuckDBCatalog::init() {
     auto query = common::stringFormat(
-        "select table_name from information_schema.tables where table_catalog = '{}' and "
-        "table_schema = '{}' order by table_name;",
-        catalogName, defaultSchemaName);
+        "select table_name from information_schema.tables where table_catalog = {} and "
+        "table_schema = {} order by table_name;",
+        quoteDuckDBStringLiteral(catalogName), quoteDuckDBStringLiteral(defaultSchemaName));
     auto result = connector.executeQuery(query);
     std::unique_ptr<duckdb::DataChunk> resultChunk;
     try {
@@ -71,8 +71,9 @@ std::string DuckDBCatalog::bindSchemaName(const binder::AttachOption& options,
 
 static std::string getQuery(const binder::BoundCreateTableInfo& info) {
     auto extraInfo = info.extraInfo->constPtrCast<BoundExtraCreateDuckDBTableInfo>();
-    return "SELECT {} " + common::stringFormat("FROM \"{}\".{}.{}", extraInfo->catalogName,
-                              extraInfo->schemaName, info.tableName);
+    return common::stringFormat("SELECT {{}} FROM {}.{}.{}",
+        quoteDuckDBIdentifier(extraInfo->catalogName), quoteDuckDBIdentifier(extraInfo->schemaName),
+        quoteDuckDBIdentifier(info.tableName));
 }
 
 void DuckDBCatalog::createForeignTable(const std::string& tableName) {
@@ -104,8 +105,9 @@ static bool getTableInfo(const DuckDBConnector& connector, const std::string& ta
     bool skipUnsupportedTable) {
     auto query =
         common::stringFormat("select data_type,column_name from information_schema.columns where "
-                             "table_name = '{}' and table_schema = '{}' and table_catalog = '{}';",
-            tableName, schemaName, catalogName);
+                             "table_name = {} and table_schema = {} and table_catalog = {};",
+            quoteDuckDBStringLiteral(tableName), quoteDuckDBStringLiteral(schemaName),
+            quoteDuckDBStringLiteral(catalogName));
     auto result = connector.executeQuery(query);
     if (result->RowCount() == 0) {
         return false;

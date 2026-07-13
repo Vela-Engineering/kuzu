@@ -18,6 +18,14 @@ class ClientContext;
 
 namespace duckdb_extension {
 
+struct DuckDBStreamingResult {
+    std::unique_ptr<duckdb::Connection> connection;
+    std::unique_ptr<duckdb::QueryResult> queryResult;
+};
+
+std::string quoteDuckDBIdentifier(const std::string& identifier);
+std::string quoteDuckDBStringLiteral(const std::string& value);
+
 enum class DuckDBConnectionType : uint8_t {
     LOCAL = 0,
     HTTP = 1,
@@ -38,6 +46,7 @@ public:
     }
 
     std::unique_ptr<duckdb::MaterializedQueryResult> executeQuery(std::string query) const;
+    DuckDBStreamingResult executeStreamingQuery(std::string query) const;
 
     void initRemoteFSSecrets(main::ClientContext* context) const {
         for (auto& fsConfig : httpfs_extension::S3FileSystemConfig::getAvailableConfigs()) {

@@ -14,26 +14,42 @@ namespace kuzu {
 namespace duckdb_extension {
 
 std::string DuckDBScanBindData::getColumnsToSelect() const {
-    std::string columnNames = "";
+    auto skips = getColumnSkips();
+    std::string columnNames;
     auto numSkippedColumns =
-        std::count_if(columnSkips.begin(), columnSkips.end(), [](auto item) { return item; });
+        std::count_if(skips.begin(), skips.end(), [](auto item) { return item; });
     if (getNumColumns() == numSkippedColumns) {
-        columnNames = columnNamesInDuckDB[0];
+        return quoteDuckDBIdentifier(columnNamesInDuckDB[0]);
     }
     for (auto i = 0u; i < getNumColumns(); i++) {
-        if (columnSkips[i]) {
+        if (skips[i]) {
             continue;
         }
-        columnNames += columnNamesInDuckDB[i];
-        columnNames += (i == getNumColumns() - 1) ? "" : ",";
+        if (!columnNames.empty()) {
+            columnNames += ",";
+        }
+        columnNames += quoteDuckDBIdentifier(columnNamesInDuckDB[i]);
     }
     return columnNames;
 }
 
+std::string DuckDBScanBindData::getQuery() const {
+    auto finalQuery = query;
+    const auto projectionPosition = finalQuery.find("{}");
+    KU_ASSERT(projectionPosition != std::string::npos);
+    finalQuery.replace(projectionPosition, 2, getColumnsToSelect());
+    return finalQuery;
+}
+
 DuckDBScanSharedState::DuckDBScanSharedState(
-    std::shared_ptr<duckdb::MaterializedQueryResult> queryResult)
+    std::unique_ptr<duckdb::MaterializedQueryResult> queryResult)
     : function::TableFuncSharedState{queryResult->RowCount()}, queryResult{std::move(queryResult)} {
 }
+
+DuckDBScanSharedState::DuckDBScanSharedState(std::unique_ptr<duckdb::Connection> connection,
+    std::unique_ptr<duckdb::QueryResult> queryResult)
+    : function::TableFuncSharedState{0}, connection{std::move(connection)},
+      queryResult{std::move(queryResult)} {}
 
 struct DuckDBScanFunction {
     static constexpr char DUCKDB_SCAN_FUNC_NAME[] = "duckdb_scan";
@@ -54,7 +70,6 @@ struct DuckDBScanFunction {
 std::unique_ptr<TableFuncSharedState> DuckDBScanFunction::initSharedState(
     const TableFuncInitSharedStateInput& input) {
     auto scanBindData = input.bindData->constPtrCast<DuckDBScanBindData>();
-    auto columnNames = scanBindData->getColumnsToSelect();
     std::string predicatesString = "";
     for (auto& predicates : scanBindData->getColumnPredicates()) {
         if (predicates.isEmpty()) {
@@ -66,13 +81,10 @@ std::unique_ptr<TableFuncSharedState> DuckDBScanFunction::initSharedState(
             predicatesString += stringFormat(" AND {}", predicates.toString());
         }
     }
-    auto finalQuery = stringFormat(scanBindData->query, columnNames) + predicatesString;
-    auto result = scanBindData->connector.executeQuery(finalQuery);
-    if (result->HasError()) {
-        throw RuntimeException(
-            stringFormat("Failed to execute query due to error: {}", result->GetError()));
-    }
-    return std::make_unique<DuckDBScanSharedState>(std::move(result));
+    auto result =
+        scanBindData->connector.executeStreamingQuery(scanBindData->getQuery() + predicatesString);
+    return std::make_unique<DuckDBScanSharedState>(std::move(result.connection),
+        std::move(result.queryResult));
 }
 
 std::unique_ptr<TableFuncLocalState> DuckDBScanFunction::initLocalState(
@@ -84,15 +96,25 @@ offset_t DuckDBScanFunction::tableFunc(const TableFuncInput& input, TableFuncOut
     auto duckdbScanSharedState = input.sharedState->ptrCast<DuckDBScanSharedState>();
     auto duckdbScanBindData = input.bindData->constPtrCast<DuckDBScanBindData>();
     std::unique_ptr<duckdb::DataChunk> result;
-    try {
-        // Duckdb queryResult.fetch() is not thread safe, we have to acquire a lock there.
+    {
         std::lock_guard<std::mutex> lock{duckdbScanSharedState->mtx};
-        result = duckdbScanSharedState->queryResult->Fetch();
-    } catch (std::exception& e) {
-        return 0;
-    }
-    if (result == nullptr) {
-        return 0;
+        if (duckdbScanSharedState->finished) {
+            return 0;
+        }
+        try {
+            result = duckdbScanSharedState->queryResult->Fetch();
+        } catch (const std::exception& e) {
+            throw RuntimeException(
+                stringFormat("Failed to fetch DuckDB query result: {}", e.what()));
+        }
+        if (duckdbScanSharedState->queryResult->HasError()) {
+            throw RuntimeException(stringFormat("Failed to fetch DuckDB query result: {}",
+                duckdbScanSharedState->queryResult->GetError()));
+        }
+        if (result == nullptr) {
+            duckdbScanSharedState->finished = true;
+            return 0;
+        }
     }
     duckdbScanBindData->converter.convertDuckDBResultToVector(*result, output.dataChunk,
         duckdbScanBindData->getColumnSkips());

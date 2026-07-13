@@ -42,6 +42,24 @@ Attached database successfully.
 8|Farooq
 9|Greg
 10|Hubert Blaine Wolfeschlegelsteinhausenbergerdorff
+-STATEMENT CREATE NODE TABLE person_create_merge (ID INT64, fName STRING, PRIMARY KEY(ID));
+---- ok
+-STATEMENT LOAD FROM tinysnb.person WITH ID AS personID, fName AS personName LIMIT 2 CREATE (:person_create_merge {ID: personID, fName: personName});
+---- ok
+-STATEMENT MATCH (p:person_create_merge) RETURN p.ID, p.fName ORDER BY p.ID;
+---- 2
+0|Alice
+2|Bob
+-STATEMENT LOAD FROM tinysnb.person WITH ID AS personID, fName AS personName MERGE (p:person_create_merge {ID: personID}) ON CREATE SET p.fName = personName ON MATCH SET p.fName = personName + '_matched';
+---- ok
+-STATEMENT MATCH (p:person_create_merge) WHERE p.ID <= 3 RETURN p.ID, p.fName ORDER BY p.ID;
+---- 3
+0|Alice_matched
+2|Bob_matched
+3|Carol
+-STATEMENT MATCH (p:person_create_merge) RETURN count(*);
+---- 1
+8
 -STATEMENT LOAD FROM tinysnb.person RETURN *;
 ---- 8
 0|Alice|1|True|False|35|5.000000|1900-01-01|2011-08-20 11:25:30|3 years 2 days 13:02:00|[10,5]|[Aida]|[[10,8],[6,7,8]]|1.731000|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|[96,54,86,92]
@@ -62,6 +80,21 @@ Elizabeth
 Farooq
 Greg
 Hubert Blaine Wolfeschlegelsteinhausenbergerdorff
+-STATEMENT LOAD FROM tinysnb.tableOfTypes RETURN id LIMIT 1;
+---- 1
+0
+-STATEMENT LOAD FROM tinysnb.tableOfTypes RETURN count(*);
+---- 1
+49999
+-CREATE_CONNECTION conn2
+-BEGIN_CONCURRENT_EXECUTION
+-STATEMENT LOAD FROM tinysnb.tableOfTypes RETURN count(*);
+---- 1
+49999
+-STATEMENT [conn2] LOAD FROM tinysnb.tableOfTypes RETURN count(*);
+---- 1
+49999
+-END_CONCURRENT_EXECUTION
 -STATEMENT LOAD FROM tinysnb.person WHERE ID > 5 RETURN fName;
 ---- 4
 Elizabeth
@@ -103,6 +136,15 @@ Detached database successfully.
 -STATEMENT LOAD FROM tinysnb.person RETURN *;
 ---- error
 Runtime exception: No database named tinysnb.
+-STATEMENT ATTACH '${KUZU_ROOT_DIRECTORY}/dataset/databases/duckdb_database/tinysnb.db' as `select Space'"Mixed` (dbtype duckdb, skip_unsupported_table = true);
+---- 1
+Attached database successfully.
+-STATEMENT LOAD FROM `select Space'"Mixed`.person RETURN fName LIMIT 1;
+---- 1
+Alice
+-STATEMENT DETACH `select Space'"Mixed`;
+---- 1
+Detached database successfully.
 -LOG AttachMultipleDuckDB
 -STATEMENT ATTACH '${KUZU_ROOT_DIRECTORY}/dataset/databases/duckdb_database/tinysnb.db' (dbtype duckdb, skip_unsupported_table = true);
 ---- 1
@@ -111,12 +153,13 @@ Attached database successfully.
 ---- 1
 Attached database successfully.
 -STATEMENT CALL SHOW_TABLES() RETURN *;
----- 8
+---- 9
 0|movies|ATTACHED|tinysnb(DUCKDB)|
 0|person_copy|NODE|local(kuzu)|
 0|person|ATTACHED|Other1(DUCKDB)|
 1|organisation|ATTACHED|tinysnb(DUCKDB)|
 1|person_copy1|NODE|local(kuzu)|
+2|person_create_merge|NODE|local(kuzu)|
 2|person|ATTACHED|tinysnb(DUCKDB)|
 3|tableOfTypes|ATTACHED|tinysnb(DUCKDB)|
 4|tableOfTypes1|ATTACHED|tinysnb(DUCKDB)|
@@ -202,18 +245,34 @@ Attached database successfully.
 -STATEMENT USE noneExist;
 ---- ok
 -STATEMENT CALL show_tables() RETURN *;
----- 9
+---- 10
 0|employee|ATTACHED|kuzu(DUCKDB)|
 0|movies|ATTACHED|tinysnb(DUCKDB)|
 0|person_copy|NODE|local(kuzu)|
 0|person|ATTACHED|Other1(DUCKDB)|
 1|organisation|ATTACHED|tinysnb(DUCKDB)|
 1|person_copy1|NODE|local(kuzu)|
+2|person_create_merge|NODE|local(kuzu)|
 2|person|ATTACHED|tinysnb(DUCKDB)|
 3|tableOfTypes|ATTACHED|tinysnb(DUCKDB)|
 4|tableOfTypes1|ATTACHED|tinysnb(DUCKDB)|
 -STATEMENT DETACH noneExist;
 ---- ok
+
+-CASE PropagateDuckDBQueryAndFetchErrors
+-LOAD_DYNAMIC_EXTENSION duckdb
+-STATEMENT ATTACH '${KUZU_ROOT_DIRECTORY}/dataset/databases/duckdb_database/fetch_error.db' as fetchError (dbtype duckdb);
+---- 1
+Attached database successfully.
+-STATEMENT LOAD FROM fetchError.query_error RETURN value;
+---- error(regex)
+^.*query-only failure.*$
+-STATEMENT LOAD FROM fetchError.fetch_error RETURN value;
+---- error
+Runtime exception: Failed to fetch DuckDB query result: Invalid Input Error: fetch-only failure
+-STATEMENT DETACH fetchError;
+---- 1
+Detached database successfully.
 
 -CASE TestingSupportedDBDataTypes
 -SKIP_FSM_LEAK_CHECK
