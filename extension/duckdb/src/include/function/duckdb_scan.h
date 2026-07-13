@@ -59,6 +59,7 @@ struct DuckDBScanBindData : function::TableFuncBindData {
           converter{other.converter} {}
 
     std::string getColumnsToSelect() const;
+    std::string getQuery() const;
 
     std::unique_ptr<TableFuncBindData> copy() const override {
         return std::make_unique<DuckDBScanBindData>(*this);
@@ -66,9 +67,13 @@ struct DuckDBScanBindData : function::TableFuncBindData {
 };
 
 struct DuckDBScanSharedState final : function::TableFuncSharedState {
-    explicit DuckDBScanSharedState(std::shared_ptr<duckdb::MaterializedQueryResult> queryResult);
+    explicit DuckDBScanSharedState(std::unique_ptr<duckdb::MaterializedQueryResult> queryResult);
+    DuckDBScanSharedState(std::unique_ptr<duckdb::Connection> connection,
+        std::unique_ptr<duckdb::QueryResult> queryResult);
 
-    std::shared_ptr<duckdb::MaterializedQueryResult> queryResult;
+    std::unique_ptr<duckdb::Connection> connection;
+    std::unique_ptr<duckdb::QueryResult> queryResult;
+    bool finished = false;
 };
 
 function::TableFunction getScanFunction(std::shared_ptr<DuckDBTableScanInfo> scanInfo);
